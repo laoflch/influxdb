@@ -477,7 +477,10 @@ func (s FluxQueryService) Check(ctx context.Context) check.Response {
 }
 
 // SimpleQuery runs a flux query with common parameters and returns CSV results.
-func SimpleQuery(addr, flux, org, token string) ([]byte, error) {
+func SimpleQuery(addr, flux, org, token string, headers ...string) ([]byte, error) {
+	if len(headers)%2 != 0 {
+		return nil, fmt.Errorf("headers must be key value pairs")
+	}
 	u, err := NewURL(addr, prefixQuery)
 	if err != nil {
 		return nil, err
@@ -510,8 +513,13 @@ func SimpleQuery(addr, flux, org, token string) ([]byte, error) {
 
 	SetToken(token, req)
 
+	// Default headers.
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/csv")
+	// Apply custom headers.
+	for i := 0; i < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
 
 	insecureSkipVerify := false
 	hc := NewClient(u.Scheme, insecureSkipVerify)
