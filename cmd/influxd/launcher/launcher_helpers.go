@@ -336,6 +336,10 @@ func (tl *TestLauncher) BucketService(tb testing.TB) *http.BucketService {
 	return &http.BucketService{Client: tl.HTTPClient(tb), OpPrefix: kv.OpPrefix}
 }
 
+func (tl *TestLauncher) CheckService() platform.CheckService {
+	return tl.kvService
+}
+
 func (tl *TestLauncher) DashboardService(tb testing.TB) *http.DashboardService {
 	tb.Helper()
 	return &http.DashboardService{Client: tl.HTTPClient(tb)}
@@ -351,8 +355,16 @@ func (tl *TestLauncher) NotificationEndpointService(tb testing.TB) *http.Notific
 	return http.NewNotificationEndpointService(tl.HTTPClient(tb))
 }
 
+func (tl *TestLauncher) NotificationRuleService() platform.NotificationRuleStore {
+	return tl.kvService
+}
+
 func (tl *TestLauncher) PkgerService(tb testing.TB) pkger.SVC {
 	return &http.PkgerService{Client: tl.HTTPClient(tb)}
+}
+
+func (tl *TestLauncher) TaskServiceKV() platform.TaskService {
+	return tl.kvService
 }
 
 func (tl *TestLauncher) TelegrafService(tb testing.TB) *http.TelegrafService {
@@ -365,8 +377,8 @@ func (tl *TestLauncher) VariableService(tb testing.TB) *http.VariableService {
 	return &http.VariableService{Client: tl.HTTPClient(tb)}
 }
 
-func (tl *TestLauncher) AuthorizationService() *http.AuthorizationService {
-	return &http.AuthorizationService{Addr: tl.URL(), Token: tl.Auth.Token}
+func (tl *TestLauncher) AuthorizationService(tb testing.TB) *http.AuthorizationService {
+	return &http.AuthorizationService{Client: tl.HTTPClient(tb)}
 }
 
 func (tl *TestLauncher) TaskService() *http.TaskService {

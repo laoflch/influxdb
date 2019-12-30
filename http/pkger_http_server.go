@@ -11,7 +11,6 @@ import (
 	"github.com/go-chi/chi/middleware"
 	"github.com/influxdata/influxdb"
 	pctx "github.com/influxdata/influxdb/context"
-	"github.com/influxdata/influxdb/kit/tracing"
 	"github.com/influxdata/influxdb/pkg/httpc"
 	"github.com/influxdata/influxdb/pkger"
 	"go.uber.org/zap"
@@ -123,9 +122,10 @@ func (s *HandlerPkg) createPkg(w http.ResponseWriter, r *http.Request) {
 type (
 	// ReqApplyPkg is the request body for a json or yaml body for the apply pkg endpoint.
 	ReqApplyPkg struct {
-		DryRun bool       `json:"dryRun" yaml:"dryRun"`
-		OrgID  string     `json:"orgID" yaml:"orgID"`
-		Pkg    *pkger.Pkg `json:"package" yaml:"package"`
+		DryRun  bool              `json:"dryRun" yaml:"dryRun"`
+		OrgID   string            `json:"orgID" yaml:"orgID"`
+		Pkg     *pkger.Pkg        `json:"package" yaml:"package"`
+		Secrets map[string]string `json:"secrets"`
 	}
 
 	// RespApplyPkg is the response body for the apply pkg endpoint.
@@ -186,7 +186,7 @@ func (s *HandlerPkg) applyPkg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sum, err = s.svc.Apply(r.Context(), *orgID, userID, parsedPkg)
+	sum, err = s.svc.Apply(r.Context(), *orgID, userID, parsedPkg, pkger.ApplyWithSecrets(reqBody.Secrets))
 	if err != nil && !pkger.IsParseErr(err) {
 		s.logger.Error("failed to apply pkg", zap.Error(err))
 		s.HandleHTTPError(r.Context(), err, w)
@@ -289,24 +289,36 @@ func (s *PkgerService) CreatePkg(ctx context.Context, setters ...pkger.CreatePkg
 // for later calls to Apply. This func will be run on an Apply if it has not been run
 // already.
 func (s *PkgerService) DryRun(ctx context.Context, orgID, userID influxdb.ID, pkg *pkger.Pkg) (pkger.Summary, pkger.Diff, error) {
-	return s.apply(ctx, orgID, pkg, true)
+	reqBody := ReqApplyPkg{
+		OrgID:  orgID.String(),
+		DryRun: true,
+		Pkg:    pkg,
+	}
+	return s.apply(ctx, reqBody)
 }
 
 // Apply will apply all the resources identified in the provided pkg. The entire pkg will be applied
 // in its entirety. If a failure happens midway then the entire pkg will be rolled back to the state
-// from before the pkg were applied.
-func (s *PkgerService) Apply(ctx context.Context, orgID, userID influxdb.ID, pkg *pkger.Pkg) (pkger.Summary, error) {
-	sum, _, err := s.apply(ctx, orgID, pkg, false)
+// from before the pkg was applied.
+func (s *PkgerService) Apply(ctx context.Context, orgID, userID influxdb.ID, pkg *pkger.Pkg, opts ...pkger.ApplyOptFn) (pkger.Summary, error) {
+	var opt pkger.ApplyOpt
+	for _, o := range opts {
+		if err := o(&opt); err != nil {
+			return pkger.Summary{}, err
+		}
+	}
+
+	reqBody := ReqApplyPkg{
+		OrgID:   orgID.String(),
+		Pkg:     pkg,
+		Secrets: opt.MissingSecrets,
+	}
+
+	sum, _, err := s.apply(ctx, reqBody)
 	return sum, err
 }
 
-func (s *PkgerService) apply(ctx context.Context, orgID influxdb.ID, pkg *pkger.Pkg, dryRun bool) (pkger.Summary, pkger.Diff, error) {
-	reqBody := ReqApplyPkg{
-		OrgID:  orgID.String(),
-		DryRun: dryRun,
-		Pkg:    pkg,
-	}
-
+func (s *PkgerService) apply(ctx context.Context, reqBody ReqApplyPkg) (pkger.Summary, pkger.Diff, error) {
 	var resp RespApplyPkg
 	err := s.Client.
 		PostJSON(reqBody, prefixPackages, "/apply").
@@ -333,13 +345,4 @@ func newDecodeErr(encoding string, err error) *influxdb.Error {
 		Code: influxdb.EInvalid,
 		Err:  err,
 	}
-}
-
-func traceMW(next http.Handler) http.Handler {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		span, ctx := tracing.StartSpanFromContext(r.Context())
-		defer span.Finish()
-		next.ServeHTTP(w, r.WithContext(ctx))
-	}
-	return http.HandlerFunc(fn)
 }

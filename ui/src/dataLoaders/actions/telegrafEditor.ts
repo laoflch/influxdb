@@ -1,10 +1,37 @@
 import {Bucket} from 'src/types'
+import {getTelegrafPlugins} from 'src/client'
+import {RemoteDataState} from 'src/types'
+import {Dispatch} from 'react'
 import {
   TelegrafEditorPluginState,
   TelegrafEditorActivePluginState,
+  TelegrafEditorBasicPlugin,
 } from 'src/dataLoaders/reducers/telegrafEditor'
 
-export type PluginAction = ReturnType<typeof setPlugins>
+export type PluginResourceAction =
+  | ReturnType<typeof setPlugins>
+  | ReturnType<typeof setPluginLoadingState>
+
+export const getPlugins = () => async (
+  dispatch: Dispatch<PluginResourceAction>
+) => {
+  dispatch(setPluginLoadingState(RemoteDataState.Loading))
+
+  const result = await getTelegrafPlugins({}, {})
+
+  if (result.status === 200) {
+    const plugins = result.data.plugins as TelegrafEditorBasicPlugin[]
+
+    dispatch(setPlugins(plugins))
+  }
+
+  dispatch(setPluginLoadingState(RemoteDataState.Done))
+}
+
+export const setPluginLoadingState = (state: RemoteDataState) => ({
+  type: 'SET_TELEGRAF_EDITOR_PLUGINS_LOADING_STATE' as 'SET_TELEGRAF_EDITOR_PLUGINS_LOADING_STATE',
+  payload: state,
+})
 
 export const setPlugins = (plugins: TelegrafEditorPluginState) => ({
   type: 'SET_TELEGRAF_EDITOR_PLUGINS' as 'SET_TELEGRAF_EDITOR_PLUGINS',
@@ -19,15 +46,21 @@ export const setActivePlugins = (plugins: TelegrafEditorActivePluginState) => ({
 })
 
 export type EditorAction =
-  | ReturnType<typeof setMode>
+  | ReturnType<typeof setLookup>
+  | ReturnType<typeof setList>
   | ReturnType<typeof setText>
   | ReturnType<typeof setBucket>
   | ReturnType<typeof setFilter>
   | ReturnType<typeof reset>
 
-export const setMode = (mode: 'adding' | 'indexing') => ({
-  type: 'SET_TELEGRAF_EDITOR_MODE' as 'SET_TELEGRAF_EDITOR_MODE',
-  payload: mode,
+export const setLookup = (show: boolean) => ({
+  type: 'SET_TELEGRAF_EDITOR_LOOKUP' as 'SET_TELEGRAF_EDITOR_LOOKUP',
+  payload: show,
+})
+
+export const setList = (show: boolean) => ({
+  type: 'SET_TELEGRAF_EDITOR_LIST' as 'SET_TELEGRAF_EDITOR_LIST',
+  payload: show,
 })
 
 export const setText = (text: string) => ({

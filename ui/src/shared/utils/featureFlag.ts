@@ -1,21 +1,23 @@
 import {FunctionComponent} from 'react'
 import {CLOUD, CLOUD_BILLING_VISIBLE} from 'src/shared/constants'
 
-const OSS_FLAGS = {
+export const OSS_FLAGS = {
   alerting: false,
   deleteWithPredicate: false,
   monacoEditor: false,
   downloadCellCSV: false,
   telegrafEditor: false,
+  queryBuilderGrouping: false,
 }
 
-const CLOUD_FLAGS = {
+export const CLOUD_FLAGS = {
   alerting: true,
   deleteWithPredicate: false,
   monacoEditor: false,
   cloudBilling: CLOUD_BILLING_VISIBLE, // should be visible in dev and acceptance, but not in cloud
   downloadCellCSV: false,
   telegrafEditor: false,
+  queryBuilderGrouping: false,
 }
 
 export const isFlagEnabled = (flagName: string, equals?: string | boolean) => {
@@ -63,36 +65,21 @@ export const FeatureFlag: FunctionComponent<{
   return children as any
 }
 
+export const getUserFlags = function getUserFlags() {
+  const flagKeys = CLOUD ? Object.keys(CLOUD_FLAGS) : Object.keys(OSS_FLAGS)
+
+  const flags = {}
+  flagKeys.forEach(key => {
+    flags[key] = isFlagEnabled(key)
+  })
+
+  return flags
+}
+
 /* eslint-disable no-console */
 const list = () => {
   console.log('Currently Available Feature Flags')
-  if (CLOUD) {
-    console.table(
-      Object.keys(CLOUD_FLAGS)
-        .map(k => [k, isFlagEnabled(k)])
-        .reduce((prev, curr) => {
-          if (typeof curr[0] === 'boolean') {
-            return prev
-          }
-
-          prev[curr[0]] = curr[1]
-          return prev
-        }, {})
-    )
-  } else {
-    console.table(
-      Object.keys(OSS_FLAGS)
-        .map(k => [k, isFlagEnabled(k)])
-        .reduce((prev, curr) => {
-          if (typeof curr[0] === 'boolean') {
-            return prev
-          }
-
-          prev[curr[0]] = curr[1]
-          return prev
-        }, {})
-    )
-  }
+  console.table(getUserFlags())
 }
 /* eslint-enable no-console */
 

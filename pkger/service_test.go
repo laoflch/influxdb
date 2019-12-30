@@ -3,14 +3,19 @@ package pkger
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
+	"regexp"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/mock"
+	"github.com/influxdata/influxdb/notification"
+	icheck "github.com/influxdata/influxdb/notification/check"
 	"github.com/influxdata/influxdb/notification/endpoint"
+	"github.com/influxdata/influxdb/notification/rule"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -20,9 +25,12 @@ func TestService(t *testing.T) {
 	newTestService := func(opts ...ServiceSetterFn) *Service {
 		opt := serviceOpt{
 			bucketSVC:   mock.NewBucketService(),
+			checkSVC:    mock.NewCheckService(),
 			dashSVC:     mock.NewDashboardService(),
 			labelSVC:    mock.NewLabelService(),
 			endpointSVC: mock.NewNotificationEndpointService(),
+			ruleSVC:     mock.NewNotificationRuleStore(),
+			taskSVC:     mock.NewTaskService(),
 			teleSVC:     mock.NewTelegrafConfigStore(),
 			varSVC:      mock.NewVariableService(),
 		}
@@ -32,9 +40,13 @@ func TestService(t *testing.T) {
 
 		return NewService(
 			WithBucketSVC(opt.bucketSVC),
+			WithCheckSVC(opt.checkSVC),
 			WithDashboardSVC(opt.dashSVC),
 			WithLabelSVC(opt.labelSVC),
-			WithNoticationEndpointSVC(opt.endpointSVC),
+			WithNotificationEndpointSVC(opt.endpointSVC),
+			WithNotificationRuleSVC(opt.ruleSVC),
+			WithSecretSVC(opt.secretSVC),
+			WithTaskSVC(opt.taskSVC),
 			WithTelegrafSVC(opt.teleSVC),
 			WithVariableSVC(opt.varSVC),
 		)
@@ -99,6 +111,45 @@ func TestService(t *testing.T) {
 					}
 					assert.Equal(t, expected, diff.Buckets[0])
 				})
+			})
+		})
+
+		t.Run("checks", func(t *testing.T) {
+			testfileRunner(t, "testdata/checks.yml", func(t *testing.T, pkg *Pkg) {
+				fakeCheckSVC := mock.NewCheckService()
+				id := influxdb.ID(1)
+				existing := &icheck.Deadman{
+					Base: icheck.Base{
+						ID:          id,
+						Name:        "check_1",
+						Description: "old desc",
+					},
+				}
+				fakeCheckSVC.FindCheckFn = func(ctx context.Context, f influxdb.CheckFilter) (influxdb.Check, error) {
+					if f.Name != nil && *f.Name == "check_1" {
+						return existing, nil
+					}
+					return nil, errors.New("not found")
+				}
+
+				svc := newTestService(WithCheckSVC(fakeCheckSVC))
+
+				_, diff, err := svc.DryRun(context.TODO(), influxdb.ID(100), 0, pkg)
+				require.NoError(t, err)
+
+				checks := diff.Checks
+				require.Len(t, checks, 2)
+				check0 := checks[0]
+				assert.True(t, check0.IsNew())
+				assert.Equal(t, "check_0", check0.Name)
+				assert.Zero(t, check0.ID)
+				assert.Nil(t, check0.Old)
+
+				check1 := checks[1]
+				assert.False(t, check1.IsNew())
+				assert.Equal(t, "check_1", check1.Name)
+				assert.NotZero(t, check1.ID)
+				assert.Equal(t, existing, check1.Old.Check)
 			})
 		})
 
@@ -195,7 +246,7 @@ func TestService(t *testing.T) {
 					return []influxdb.NotificationEndpoint{existing}, 1, nil
 				}
 
-				svc := newTestService(WithNoticationEndpointSVC(fakeEndpointSVC))
+				svc := newTestService(WithNotificationEndpointSVC(fakeEndpointSVC))
 
 				_, diff, err := svc.DryRun(context.TODO(), influxdb.ID(100), 0, pkg)
 				require.NoError(t, err)
@@ -237,6 +288,81 @@ func TestService(t *testing.T) {
 					},
 				}
 				assert.Equal(t, expected, existingEndpoints[0])
+			})
+		})
+
+		t.Run("notification rules", func(t *testing.T) {
+			testfileRunner(t, "testdata/notification_rule.yml", func(t *testing.T, pkg *Pkg) {
+				fakeEndpointSVC := mock.NewNotificationEndpointService()
+				id := influxdb.ID(1)
+				existing := &endpoint.HTTP{
+					Base: endpoint.Base{
+						ID: &id,
+						// This name here matches the endpoint identified in the pkg notification rule
+						Name:        "endpoint_0",
+						Description: "old desc",
+						Status:      influxdb.TaskStatusInactive,
+					},
+					Method:     "POST",
+					AuthMethod: "none",
+					URL:        "https://www.example.com/endpoint/old",
+				}
+				fakeEndpointSVC.FindNotificationEndpointsF = func(ctx context.Context, f influxdb.NotificationEndpointFilter, opt ...influxdb.FindOptions) ([]influxdb.NotificationEndpoint, int, error) {
+					return []influxdb.NotificationEndpoint{existing}, 1, nil
+				}
+
+				svc := newTestService(WithNotificationEndpointSVC(fakeEndpointSVC))
+
+				_, diff, err := svc.DryRun(context.TODO(), influxdb.ID(100), 0, pkg)
+				require.NoError(t, err)
+
+				require.Len(t, diff.NotificationRules, 1)
+
+				actual := diff.NotificationRules[0]
+				assert.Equal(t, "rule_0", actual.Name)
+				assert.Equal(t, "desc_0", actual.Description)
+				assert.Equal(t, "http", actual.EndpointType)
+				assert.Equal(t, existing.Name, actual.EndpointName)
+				assert.Equal(t, SafeID(*existing.ID), actual.EndpointID)
+				assert.Equal(t, influxdb.Active, actual.Status)
+				assert.Equal(t, (10 * time.Minute).String(), actual.Every)
+				assert.Equal(t, (30 * time.Second).String(), actual.Offset)
+
+				expectedStatusRules := []SummaryStatusRule{
+					{CurrentLevel: "CRIT", PreviousLevel: "OK"},
+					{CurrentLevel: "WARN"},
+				}
+				assert.Equal(t, expectedStatusRules, actual.StatusRules)
+
+				expectedTagRules := []SummaryTagRule{
+					{Key: "k1", Value: "v1", Operator: "equal"},
+					{Key: "k1", Value: "v2", Operator: "equal"},
+				}
+				assert.Equal(t, expectedTagRules, actual.TagRules)
+			})
+
+			t.Run("should error if endpoint name is not in pkg or in platform", func(t *testing.T) {
+				testfileRunner(t, "testdata/notification_rule.yml", func(t *testing.T, pkg *Pkg) {
+					svc := newTestService()
+
+					_, _, err := svc.DryRun(context.TODO(), influxdb.ID(100), 0, pkg)
+					require.Error(t, err)
+				})
+			})
+		})
+
+		t.Run("secrets not returns missing secrets", func(t *testing.T) {
+			testfileRunner(t, "testdata/notification_endpoint_secrets.yml", func(t *testing.T, pkg *Pkg) {
+				fakeSecretSVC := mock.NewSecretService()
+				fakeSecretSVC.GetSecretKeysFn = func(ctx context.Context, orgID influxdb.ID) ([]string, error) {
+					return []string{"rando-1", "rando-2"}, nil
+				}
+				svc := newTestService(WithSecretSVC(fakeSecretSVC))
+
+				sum, _, err := svc.DryRun(context.TODO(), influxdb.ID(100), 0, pkg)
+				require.NoError(t, err)
+
+				assert.Equal(t, []string{"routing-key"}, sum.MissingSecrets)
 			})
 		})
 
@@ -387,6 +513,71 @@ func TestService(t *testing.T) {
 					require.Error(t, err)
 
 					assert.GreaterOrEqual(t, fakeBktSVC.DeleteBucketCalls.Count(), 1)
+				})
+			})
+		})
+
+		t.Run("checks", func(t *testing.T) {
+			t.Run("successfully creates pkg of checks", func(t *testing.T) {
+				testfileRunner(t, "testdata/checks.yml", func(t *testing.T, pkg *Pkg) {
+					fakeCheckSVC := mock.NewCheckService()
+					fakeCheckSVC.CreateCheckFn = func(ctx context.Context, c influxdb.CheckCreate, id influxdb.ID) error {
+						c.SetID(influxdb.ID(fakeCheckSVC.CreateCheckCalls.Count() + 1))
+						return nil
+					}
+
+					svc := newTestService(WithCheckSVC(fakeCheckSVC))
+
+					orgID := influxdb.ID(9000)
+
+					sum, err := svc.Apply(context.TODO(), orgID, 0, pkg)
+					require.NoError(t, err)
+
+					require.Len(t, sum.Checks, 2)
+
+					containsWithID := func(t *testing.T, name string) {
+						for _, actualNotification := range sum.Checks {
+							actual := actualNotification.Check
+							if actual.GetID() == 0 {
+								assert.NotZero(t, actual.GetID())
+							}
+							if actual.GetName() == name {
+								return
+							}
+						}
+						assert.Fail(t, "did not find notification by name: "+name)
+					}
+
+					for _, expectedName := range []string{"check_0", "check_1"} {
+						containsWithID(t, expectedName)
+					}
+				})
+			})
+
+			t.Run("rolls back all created checks on an error", func(t *testing.T) {
+				testfileRunner(t, "testdata/checks.yml", func(t *testing.T, pkg *Pkg) {
+					fakeCheckSVC := mock.NewCheckService()
+					fakeCheckSVC.CreateCheckFn = func(ctx context.Context, c influxdb.CheckCreate, id influxdb.ID) error {
+						c.SetID(influxdb.ID(fakeCheckSVC.CreateCheckCalls.Count() + 1))
+						if fakeCheckSVC.CreateCheckCalls.Count() == 1 {
+							return errors.New("hit that kill count")
+						}
+						return nil
+					}
+
+					// create some dupes
+					for name, c := range pkg.mChecks {
+						pkg.mChecks["copy"+name] = c
+					}
+
+					svc := newTestService(WithCheckSVC(fakeCheckSVC))
+
+					orgID := influxdb.ID(9000)
+
+					_, err := svc.Apply(context.TODO(), orgID, 0, pkg)
+					require.Error(t, err)
+
+					assert.GreaterOrEqual(t, fakeCheckSVC.DeleteCheckCalls.Count(), 1)
 				})
 			})
 		})
@@ -614,7 +805,7 @@ func TestService(t *testing.T) {
 
 						fakeLabelSVC := mock.NewLabelService()
 						fakeLabelSVC.CreateLabelFn = func(_ context.Context, l *influxdb.Label) error {
-							l.ID = influxdb.ID(fakeLabelSVC.CreateLabelCalls.Count())
+							l.ID = influxdb.ID(fakeLabelSVC.CreateLabelCalls.Count() + 1)
 							return nil
 						}
 						fakeLabelSVC.CreateLabelMappingFn = func(_ context.Context, mapping *influxdb.LabelMapping) error {
@@ -664,6 +855,26 @@ func TestService(t *testing.T) {
 				)
 			})
 
+			t.Run("maps checks with labels", func(t *testing.T) {
+				testLabelMappingFn(
+					t,
+					"testdata/checks.yml",
+					2, // 1 for each check
+					func() []ServiceSetterFn {
+						fakeCheckSVC := mock.NewCheckService()
+						fakeCheckSVC.CreateCheckFn = func(ctx context.Context, c influxdb.CheckCreate, id influxdb.ID) error {
+							c.Check.SetID(influxdb.ID(rand.Int()))
+							return nil
+						}
+						fakeCheckSVC.FindCheckFn = func(ctx context.Context, f influxdb.CheckFilter) (influxdb.Check, error) {
+							return nil, errors.New("check not found")
+						}
+
+						return []ServiceSetterFn{WithCheckSVC(fakeCheckSVC)}
+					},
+				)
+			})
+
 			t.Run("maps dashboards with labels", func(t *testing.T) {
 				testLabelMappingFn(
 					t,
@@ -676,6 +887,83 @@ func TestService(t *testing.T) {
 							return nil
 						}
 						return []ServiceSetterFn{WithDashboardSVC(fakeDashSVC)}
+					},
+				)
+			})
+
+			t.Run("maps notification endpoints with labels", func(t *testing.T) {
+				testLabelMappingFn(
+					t,
+					"testdata/notification_endpoint.yml",
+					5,
+					func() []ServiceSetterFn {
+						fakeEndpointSVC := mock.NewNotificationEndpointService()
+						fakeEndpointSVC.CreateNotificationEndpointF = func(ctx context.Context, nr influxdb.NotificationEndpoint, userID influxdb.ID) error {
+							nr.SetID(influxdb.ID(rand.Int()))
+							return nil
+						}
+						return []ServiceSetterFn{WithNotificationEndpointSVC(fakeEndpointSVC)}
+					},
+				)
+			})
+
+			t.Run("maps notification rules with labels", func(t *testing.T) {
+				testLabelMappingFn(
+					t,
+					"testdata/notification_rule.yml",
+					1,
+					func() []ServiceSetterFn {
+						fakeEndpointSVC := mock.NewNotificationEndpointService()
+						fakeEndpointSVC.FindNotificationEndpointsF = func(ctx context.Context, f influxdb.NotificationEndpointFilter, _ ...influxdb.FindOptions) ([]influxdb.NotificationEndpoint, int, error) {
+							id := influxdb.ID(9)
+							return []influxdb.NotificationEndpoint{
+								&endpoint.HTTP{
+									Base: endpoint.Base{
+										ID:   &id,
+										Name: "endpoint_0",
+									},
+									AuthMethod: "none",
+								},
+							}, 1, nil
+						}
+						fakeRuleStore := mock.NewNotificationRuleStore()
+						fakeRuleStore.CreateNotificationRuleF = func(ctx context.Context, nr influxdb.NotificationRuleCreate, userID influxdb.ID) error {
+							nr.SetID(influxdb.ID(fakeRuleStore.CreateNotificationRuleCalls.Count() + 1))
+							return nil
+						}
+						return []ServiceSetterFn{
+							WithNotificationEndpointSVC(fakeEndpointSVC),
+							WithNotificationRuleSVC(fakeRuleStore),
+						}
+					},
+				)
+			})
+
+			t.Run("maps tasks with labels", func(t *testing.T) {
+				testLabelMappingFn(
+					t,
+					"testdata/tasks.yml",
+					2,
+					func() []ServiceSetterFn {
+						fakeTaskSVC := mock.NewTaskService()
+						fakeTaskSVC.CreateTaskFn = func(ctx context.Context, tc influxdb.TaskCreate) (*influxdb.Task, error) {
+							reg := regexp.MustCompile(`name: "(.+)",`)
+							names := reg.FindStringSubmatch(tc.Flux)
+							if len(names) < 2 {
+								return nil, errors.New("bad flux query provided: " + tc.Flux)
+							}
+							return &influxdb.Task{
+								ID:             influxdb.ID(rand.Int()),
+								Type:           tc.Type,
+								OrganizationID: tc.OrganizationID,
+								OwnerID:        tc.OwnerID,
+								Name:           names[1],
+								Description:    tc.Description,
+								Status:         tc.Status,
+								Flux:           tc.Flux,
+							}, nil
+						}
+						return []ServiceSetterFn{WithTaskSVC(fakeTaskSVC)}
 					},
 				)
 			})
@@ -723,7 +1011,7 @@ func TestService(t *testing.T) {
 						return nil
 					}
 
-					svc := newTestService(WithNoticationEndpointSVC(fakeEndpointSVC))
+					svc := newTestService(WithNotificationEndpointSVC(fakeEndpointSVC))
 
 					orgID := influxdb.ID(9000)
 
@@ -774,7 +1062,7 @@ func TestService(t *testing.T) {
 						pkg.mNotificationEndpoints["copy"+name] = endpoint
 					}
 
-					svc := newTestService(WithNoticationEndpointSVC(fakeEndpointSVC))
+					svc := newTestService(WithNotificationEndpointSVC(fakeEndpointSVC))
 
 					orgID := influxdb.ID(9000)
 
@@ -782,6 +1070,155 @@ func TestService(t *testing.T) {
 					require.Error(t, err)
 
 					assert.GreaterOrEqual(t, fakeEndpointSVC.DeleteNotificationEndpointCalls.Count(), 5)
+				})
+			})
+		})
+
+		t.Run("notification rules", func(t *testing.T) {
+			t.Run("successfuly creates", func(t *testing.T) {
+				testfileRunner(t, "testdata/notification_rule.yml", func(t *testing.T, pkg *Pkg) {
+					fakeEndpointSVC := mock.NewNotificationEndpointService()
+					fakeEndpointSVC.FindNotificationEndpointsF = func(ctx context.Context, f influxdb.NotificationEndpointFilter, _ ...influxdb.FindOptions) ([]influxdb.NotificationEndpoint, int, error) {
+						id := influxdb.ID(9)
+						return []influxdb.NotificationEndpoint{
+							&endpoint.HTTP{
+								Base: endpoint.Base{
+									ID:   &id,
+									Name: "endpoint_0",
+								},
+							},
+						}, 1, nil
+					}
+					fakeRuleStore := mock.NewNotificationRuleStore()
+					fakeRuleStore.CreateNotificationRuleF = func(ctx context.Context, nr influxdb.NotificationRuleCreate, userID influxdb.ID) error {
+						nr.SetID(influxdb.ID(fakeRuleStore.CreateNotificationRuleCalls.Count() + 1))
+						return nil
+					}
+
+					svc := newTestService(
+						WithNotificationEndpointSVC(fakeEndpointSVC),
+						WithNotificationRuleSVC(fakeRuleStore),
+					)
+
+					orgID := influxdb.ID(9000)
+
+					sum, err := svc.Apply(context.TODO(), orgID, 0, pkg)
+					require.NoError(t, err)
+
+					require.Len(t, sum.NotificationRules, 1)
+					assert.Equal(t, "rule_0", sum.NotificationRules[0].Name)
+					assert.Equal(t, "desc_0", sum.NotificationRules[0].Description)
+					assert.Equal(t, SafeID(9), sum.NotificationRules[0].EndpointID)
+					assert.Equal(t, "endpoint_0", sum.NotificationRules[0].EndpointName)
+					assert.Equal(t, "http", sum.NotificationRules[0].EndpointType)
+				})
+			})
+
+			t.Run("rolls back all created notification rules on an error", func(t *testing.T) {
+				testfileRunner(t, "testdata/notification_rule.yml", func(t *testing.T, pkg *Pkg) {
+					fakeEndpointSVC := mock.NewNotificationEndpointService()
+					fakeEndpointSVC.FindNotificationEndpointsF = func(ctx context.Context, f influxdb.NotificationEndpointFilter, _ ...influxdb.FindOptions) ([]influxdb.NotificationEndpoint, int, error) {
+						id := influxdb.ID(9)
+						return []influxdb.NotificationEndpoint{
+							&endpoint.HTTP{
+								Base: endpoint.Base{
+									ID:   &id,
+									Name: "endpoint_0",
+								},
+								AuthMethod: "none",
+							},
+						}, 1, nil
+					}
+					fakeRuleStore := mock.NewNotificationRuleStore()
+					fakeRuleStore.CreateNotificationRuleF = func(ctx context.Context, nr influxdb.NotificationRuleCreate, userID influxdb.ID) error {
+						if fakeRuleStore.CreateNotificationRuleCalls.Count() == 1 {
+							return errors.New("limit hit")
+						}
+						nr.SetID(1)
+						return nil
+					}
+					fakeRuleStore.DeleteNotificationRuleF = func(ctx context.Context, id influxdb.ID) error {
+						if id != 1 {
+							return errors.New("wrong id here")
+						}
+						return nil
+					}
+
+					pkg.mNotificationRules = append(pkg.mNotificationRules, pkg.mNotificationRules[0])
+
+					svc := newTestService(
+						WithNotificationEndpointSVC(fakeEndpointSVC),
+						WithNotificationRuleSVC(fakeRuleStore),
+					)
+
+					orgID := influxdb.ID(9000)
+
+					_, err := svc.Apply(context.TODO(), orgID, 0, pkg)
+					require.Error(t, err)
+
+					assert.Equal(t, 1, fakeRuleStore.DeleteNotificationRuleCalls.Count())
+				})
+			})
+		})
+
+		t.Run("tasks", func(t *testing.T) {
+			t.Run("successfuly creates", func(t *testing.T) {
+				testfileRunner(t, "testdata/tasks.yml", func(t *testing.T, pkg *Pkg) {
+					orgID := influxdb.ID(9000)
+
+					fakeTaskSVC := mock.NewTaskService()
+					fakeTaskSVC.CreateTaskFn = func(ctx context.Context, tc influxdb.TaskCreate) (*influxdb.Task, error) {
+						reg := regexp.MustCompile(`name: "(.+)",`)
+						names := reg.FindStringSubmatch(tc.Flux)
+						if len(names) < 2 {
+							return nil, errors.New("bad flux query provided: " + tc.Flux)
+						}
+						return &influxdb.Task{
+							ID:             influxdb.ID(fakeTaskSVC.CreateTaskCalls.Count() + 1),
+							Type:           tc.Type,
+							OrganizationID: tc.OrganizationID,
+							OwnerID:        tc.OwnerID,
+							Name:           names[1],
+							Description:    tc.Description,
+							Status:         tc.Status,
+							Flux:           tc.Flux,
+						}, nil
+					}
+
+					svc := newTestService(WithTaskSVC(fakeTaskSVC))
+
+					sum, err := svc.Apply(context.TODO(), orgID, 0, pkg)
+					require.NoError(t, err)
+
+					require.Len(t, sum.Tasks, 2)
+					for i, actual := range sum.Tasks {
+						assert.NotZero(t, actual.ID)
+						assert.Equal(t, "task_"+strconv.Itoa(i), actual.Name)
+						assert.Equal(t, "desc_"+strconv.Itoa(i), actual.Description)
+					}
+				})
+			})
+
+			t.Run("rolls back all created tasks on an error", func(t *testing.T) {
+				testfileRunner(t, "testdata/tasks.yml", func(t *testing.T, pkg *Pkg) {
+					fakeTaskSVC := mock.NewTaskService()
+					fakeTaskSVC.CreateTaskFn = func(ctx context.Context, tc influxdb.TaskCreate) (*influxdb.Task, error) {
+						if fakeTaskSVC.CreateTaskCalls.Count() == 1 {
+							return nil, errors.New("expected error")
+						}
+						return &influxdb.Task{
+							ID: influxdb.ID(fakeTaskSVC.CreateTaskCalls.Count() + 1),
+						}, nil
+					}
+
+					svc := newTestService(WithTaskSVC(fakeTaskSVC))
+
+					orgID := influxdb.ID(9000)
+
+					_, err := svc.Apply(context.TODO(), orgID, 0, pkg)
+					require.Error(t, err)
+
+					assert.Equal(t, 1, fakeTaskSVC.DeleteTaskCalls.Count())
 				})
 			})
 		})
@@ -944,6 +1381,25 @@ func TestService(t *testing.T) {
 	})
 
 	t.Run("CreatePkg", func(t *testing.T) {
+		newThresholdBase := func(i int) icheck.Base {
+			return icheck.Base{
+				ID:          influxdb.ID(i),
+				TaskID:      300,
+				Name:        fmt.Sprintf("check_%d", i),
+				Description: fmt.Sprintf("desc_%d", i),
+				Every:       mustDuration(t, time.Minute),
+				Offset:      mustDuration(t, 15*time.Second),
+				Query: influxdb.DashboardQuery{
+					Text: `from(bucket: "telegraf") |> range(start: -1m) |> filter(fn: (r) => r._field == "usage_user")`,
+				},
+				StatusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }",
+				Tags: []influxdb.Tag{
+					{Key: "key_1", Value: "val_1"},
+					{Key: "key_2", Value: "val_2"},
+				},
+			}
+		}
+
 		t.Run("with metadata sets the new pkgs metadata", func(t *testing.T) {
 			svc := newTestService(WithLogger(zaptest.NewLogger(t)))
 
@@ -1013,6 +1469,102 @@ func TestService(t *testing.T) {
 						assert.Equal(t, expectedName, actual.Name)
 						assert.Equal(t, expected.Description, actual.Description)
 						assert.Equal(t, expected.RetentionPeriod, actual.RetentionPeriod)
+					}
+					t.Run(tt.name, fn)
+				}
+			})
+
+			t.Run("checks", func(t *testing.T) {
+				tests := []struct {
+					name     string
+					newName  string
+					expected influxdb.Check
+				}{
+					{
+						name: "threshold",
+						expected: &icheck.Threshold{
+							Base: newThresholdBase(0),
+							Thresholds: []icheck.ThresholdConfig{
+								icheck.Lesser{
+									ThresholdConfigBase: icheck.ThresholdConfigBase{
+										AllValues: true,
+										Level:     notification.Critical,
+									},
+									Value: 20,
+								},
+								icheck.Greater{
+									ThresholdConfigBase: icheck.ThresholdConfigBase{
+										AllValues: true,
+										Level:     notification.Warn,
+									},
+									Value: 30,
+								},
+								icheck.Range{
+									ThresholdConfigBase: icheck.ThresholdConfigBase{
+										AllValues: true,
+										Level:     notification.Info,
+									},
+									Within: false, // outside_range
+									Min:    10,
+									Max:    25,
+								},
+								icheck.Range{
+									ThresholdConfigBase: icheck.ThresholdConfigBase{
+										AllValues: true,
+										Level:     notification.Ok,
+									},
+									Within: true, // inside_range
+									Min:    21,
+									Max:    24,
+								},
+							},
+						},
+					},
+					{
+						name:    "deadman",
+						newName: "new name",
+						expected: &icheck.Deadman{
+							Base:       newThresholdBase(1),
+							TimeSince:  mustDuration(t, time.Hour),
+							StaleTime:  mustDuration(t, 5*time.Hour),
+							ReportZero: true,
+							Level:      notification.Critical,
+						},
+					},
+				}
+
+				for _, tt := range tests {
+					fn := func(t *testing.T) {
+						id := influxdb.ID(1)
+						tt.expected.SetID(id)
+
+						checkSVC := mock.NewCheckService()
+						checkSVC.FindCheckByIDFn = func(ctx context.Context, id influxdb.ID) (influxdb.Check, error) {
+							if id != tt.expected.GetID() {
+								return nil, errors.New("uh ohhh, wrong id here: " + id.String())
+							}
+							return tt.expected, nil
+						}
+
+						svc := newTestService(WithCheckSVC(checkSVC))
+
+						resToClone := ResourceToClone{
+							Kind: KindCheck,
+							ID:   tt.expected.GetID(),
+							Name: tt.newName,
+						}
+						pkg, err := svc.CreatePkg(context.TODO(), CreateWithExistingResources(resToClone))
+						require.NoError(t, err)
+
+						checks := pkg.Summary().Checks
+						require.Len(t, checks, 1)
+
+						actual := checks[0].Check
+						expectedName := tt.expected.GetName()
+						if tt.newName != "" {
+							expectedName = tt.newName
+						}
+						assert.Equal(t, expectedName, actual.GetName())
 					}
 					t.Run(tt.name, fn)
 				}
@@ -1385,6 +1937,369 @@ func TestService(t *testing.T) {
 				}
 			})
 
+			t.Run("notification endpoints", func(t *testing.T) {
+				tests := []struct {
+					name     string
+					newName  string
+					expected influxdb.NotificationEndpoint
+				}{
+					{
+						name: "pager duty",
+						expected: &endpoint.PagerDuty{
+							Base: endpoint.Base{
+								Name:        "pd-endpoint",
+								Description: "desc",
+								Status:      influxdb.TaskStatusActive,
+							},
+							ClientURL:  "http://example.com",
+							RoutingKey: influxdb.SecretField{Key: "-routing-key"},
+						},
+					},
+					{
+						name:    "pager duty with new name",
+						newName: "new name",
+						expected: &endpoint.PagerDuty{
+							Base: endpoint.Base{
+								Name:        "pd-endpoint",
+								Description: "desc",
+								Status:      influxdb.TaskStatusActive,
+							},
+							ClientURL:  "http://example.com",
+							RoutingKey: influxdb.SecretField{Key: "-routing-key"},
+						},
+					},
+					{
+						name: "slack",
+						expected: &endpoint.Slack{
+							Base: endpoint.Base{
+								Name:        "pd-endpoint",
+								Description: "desc",
+								Status:      influxdb.TaskStatusInactive,
+							},
+							URL:   "http://example.com",
+							Token: influxdb.SecretField{Key: "tokne"},
+						},
+					},
+					{
+						name: "http basic",
+						expected: &endpoint.HTTP{
+							Base: endpoint.Base{
+								Name:        "pd-endpoint",
+								Description: "desc",
+								Status:      influxdb.TaskStatusInactive,
+							},
+							AuthMethod: "basic",
+							Method:     "POST",
+							URL:        "http://example.com",
+							Password:   influxdb.SecretField{Key: "password"},
+							Username:   influxdb.SecretField{Key: "username"},
+						},
+					},
+					{
+						name: "http bearer",
+						expected: &endpoint.HTTP{
+							Base: endpoint.Base{
+								Name:        "pd-endpoint",
+								Description: "desc",
+								Status:      influxdb.TaskStatusInactive,
+							},
+							AuthMethod: "bearer",
+							Method:     "GET",
+							URL:        "http://example.com",
+							Token:      influxdb.SecretField{Key: "token"},
+						},
+					},
+					{
+						name: "http none",
+						expected: &endpoint.HTTP{
+							Base: endpoint.Base{
+								Name:        "pd-endpoint",
+								Description: "desc",
+								Status:      influxdb.TaskStatusInactive,
+							},
+							AuthMethod: "none",
+							Method:     "GET",
+							URL:        "http://example.com",
+						},
+					},
+				}
+
+				for _, tt := range tests {
+					fn := func(t *testing.T) {
+						id := influxdb.ID(1)
+						tt.expected.SetID(id)
+
+						endpointSVC := mock.NewNotificationEndpointService()
+						endpointSVC.FindNotificationEndpointByIDF = func(ctx context.Context, id influxdb.ID) (influxdb.NotificationEndpoint, error) {
+							if id != tt.expected.GetID() {
+								return nil, errors.New("uh ohhh, wrong id here: " + id.String())
+							}
+							return tt.expected, nil
+						}
+
+						svc := newTestService(WithNotificationEndpointSVC(endpointSVC))
+
+						resToClone := ResourceToClone{
+							Kind: KindNotificationEndpoint,
+							ID:   tt.expected.GetID(),
+							Name: tt.newName,
+						}
+						pkg, err := svc.CreatePkg(context.TODO(), CreateWithExistingResources(resToClone))
+						require.NoError(t, err)
+
+						endpoints := pkg.Summary().NotificationEndpoints
+						require.Len(t, endpoints, 1)
+
+						actual := endpoints[0].NotificationEndpoint
+						expectedName := tt.expected.GetName()
+						if tt.newName != "" {
+							expectedName = tt.newName
+						}
+						assert.Equal(t, expectedName, actual.GetName())
+						assert.Equal(t, tt.expected.GetDescription(), actual.GetDescription())
+						assert.Equal(t, tt.expected.GetStatus(), actual.GetStatus())
+						assert.Equal(t, tt.expected.SecretFields(), actual.SecretFields())
+					}
+					t.Run(tt.name, fn)
+				}
+			})
+
+			t.Run("notification rules", func(t *testing.T) {
+				newRuleBase := func(id int) rule.Base {
+					return rule.Base{
+						ID:          9000,
+						Name:        "old_name",
+						Description: "desc",
+						EndpointID:  influxdb.ID(id),
+						Every:       mustDuration(t, time.Hour),
+						Offset:      mustDuration(t, time.Minute),
+						TagRules: []notification.TagRule{
+							{Tag: influxdb.Tag{Key: "k1", Value: "v1"}},
+						},
+						StatusRules: []notification.StatusRule{
+							{CurrentLevel: notification.Ok, PreviousLevel: levelPtr(notification.Warn)},
+							{CurrentLevel: notification.Critical},
+						},
+					}
+				}
+
+				tests := []struct {
+					name     string
+					newName  string
+					endpoint influxdb.NotificationEndpoint
+					rule     influxdb.NotificationRule
+				}{
+					{
+						name:    "pager duty",
+						newName: "pager_duty_name",
+						endpoint: &endpoint.PagerDuty{
+							Base: endpoint.Base{
+								ID:          newTestIDPtr(13),
+								Name:        "endpoint_0",
+								Description: "desc",
+								Status:      influxdb.TaskStatusActive,
+							},
+							ClientURL:  "http://example.com",
+							RoutingKey: influxdb.SecretField{Key: "-routing-key"},
+						},
+						rule: &rule.PagerDuty{
+							Base:            newRuleBase(13),
+							MessageTemplate: "Template",
+						},
+					},
+					{
+						name: "slack",
+						endpoint: &endpoint.Slack{
+							Base: endpoint.Base{
+								ID:          newTestIDPtr(13),
+								Name:        "endpoint_0",
+								Description: "desc",
+								Status:      influxdb.TaskStatusInactive,
+							},
+							URL:   "http://example.com",
+							Token: influxdb.SecretField{Key: "tokne"},
+						},
+						rule: &rule.Slack{
+							Base:            newRuleBase(13),
+							Channel:         "abc",
+							MessageTemplate: "SLACK TEMPlate",
+						},
+					},
+					{
+						name: "http none",
+						endpoint: &endpoint.HTTP{
+							Base: endpoint.Base{
+								ID:          newTestIDPtr(13),
+								Name:        "endpoint_0",
+								Description: "desc",
+								Status:      influxdb.TaskStatusInactive,
+							},
+							AuthMethod: "none",
+							Method:     "GET",
+							URL:        "http://example.com",
+						},
+						rule: &rule.HTTP{
+							Base: newRuleBase(13),
+						},
+					},
+				}
+
+				for _, tt := range tests {
+					fn := func(t *testing.T) {
+						endpointSVC := mock.NewNotificationEndpointService()
+						endpointSVC.FindNotificationEndpointByIDF = func(ctx context.Context, id influxdb.ID) (influxdb.NotificationEndpoint, error) {
+							if id != tt.endpoint.GetID() {
+								return nil, errors.New("uh ohhh, wrong id here: " + id.String())
+							}
+							return tt.endpoint, nil
+						}
+						ruleSVC := mock.NewNotificationRuleStore()
+						ruleSVC.FindNotificationRuleByIDF = func(ctx context.Context, id influxdb.ID) (influxdb.NotificationRule, error) {
+							return tt.rule, nil
+						}
+
+						svc := newTestService(
+							WithNotificationEndpointSVC(endpointSVC),
+							WithNotificationRuleSVC(ruleSVC),
+						)
+
+						resToClone := ResourceToClone{
+							Kind: KindNotificationRule,
+							ID:   tt.rule.GetID(),
+							Name: tt.newName,
+						}
+						pkg, err := svc.CreatePkg(context.TODO(), CreateWithExistingResources(resToClone))
+						require.NoError(t, err)
+
+						require.Len(t, pkg.Summary().NotificationRules, 1)
+
+						actualRule := pkg.Summary().NotificationRules[0]
+						assert.Zero(t, actualRule.ID)
+						assert.Zero(t, actualRule.EndpointID)
+						assert.Zero(t, actualRule.EndpointType)
+						assert.Equal(t, "endpoint_0", actualRule.EndpointName)
+
+						baseEqual := func(t *testing.T, base rule.Base) {
+							t.Helper()
+							expectedName := base.Name
+							if tt.newName != "" {
+								expectedName = tt.newName
+							}
+							assert.Equal(t, expectedName, actualRule.Name)
+							assert.Equal(t, base.Description, actualRule.Description)
+							assert.Equal(t, base.Every.TimeDuration().String(), actualRule.Every)
+							assert.Equal(t, base.Offset.TimeDuration().String(), actualRule.Offset)
+
+							for _, sRule := range base.StatusRules {
+								expected := SummaryStatusRule{CurrentLevel: sRule.CurrentLevel.String()}
+								if sRule.PreviousLevel != nil {
+									expected.PreviousLevel = sRule.PreviousLevel.String()
+								}
+								assert.Contains(t, actualRule.StatusRules, expected)
+							}
+							for _, tRule := range base.TagRules {
+								expected := SummaryTagRule{
+									Key:      tRule.Key,
+									Value:    tRule.Value,
+									Operator: tRule.Operator.String(),
+								}
+								assert.Contains(t, actualRule.TagRules, expected)
+							}
+						}
+
+						switch p := tt.rule.(type) {
+						case *rule.HTTP:
+							baseEqual(t, p.Base)
+						case *rule.PagerDuty:
+							baseEqual(t, p.Base)
+							assert.Equal(t, p.MessageTemplate, actualRule.MessageTemplate)
+						case *rule.Slack:
+							baseEqual(t, p.Base)
+							assert.Equal(t, p.MessageTemplate, actualRule.MessageTemplate)
+						}
+
+						require.Len(t, pkg.Summary().NotificationEndpoints, 1)
+
+						actualEndpoint := pkg.Summary().NotificationEndpoints[0].NotificationEndpoint
+						assert.Equal(t, tt.endpoint.GetName(), actualEndpoint.GetName())
+						assert.Equal(t, tt.endpoint.GetDescription(), actualEndpoint.GetDescription())
+						assert.Equal(t, tt.endpoint.GetStatus(), actualEndpoint.GetStatus())
+					}
+					t.Run(tt.name, fn)
+				}
+			})
+
+			t.Run("tasks", func(t *testing.T) {
+				tests := []struct {
+					name    string
+					newName string
+					task    influxdb.Task
+				}{
+					{
+						name:    "every offset is set",
+						newName: "new name",
+						task: influxdb.Task{
+							ID:     1,
+							Name:   "name_9000",
+							Every:  time.Minute.String(),
+							Offset: 10 * time.Second,
+							Type:   influxdb.TaskSystemType,
+							Flux:   `option task = { name: "larry" } from(bucket: "rucket") |> yield()`,
+						},
+					},
+					{
+						name: "cron is set",
+						task: influxdb.Task{
+							ID:   1,
+							Name: "name_0",
+							Cron: "2 * * * *",
+							Type: influxdb.TaskSystemType,
+							Flux: `option task = { name: "larry" } from(bucket: "rucket") |> yield()`,
+						},
+					},
+				}
+
+				for _, tt := range tests {
+					fn := func(t *testing.T) {
+						endpointSVC := mock.NewTaskService()
+						endpointSVC.FindTaskByIDFn = func(ctx context.Context, id influxdb.ID) (*influxdb.Task, error) {
+							if id != tt.task.ID {
+								return nil, errors.New("wrong id provided: " + id.String())
+							}
+							return &tt.task, nil
+						}
+
+						svc := newTestService(WithTaskSVC(endpointSVC))
+
+						resToClone := ResourceToClone{
+							Kind: KindTask,
+							ID:   tt.task.ID,
+							Name: tt.newName,
+						}
+						pkg, err := svc.CreatePkg(context.TODO(), CreateWithExistingResources(resToClone))
+						require.NoError(t, err)
+
+						tasks := pkg.Summary().Tasks
+						require.Len(t, tasks, 1)
+
+						expectedName := tt.task.Name
+						if tt.newName != "" {
+							expectedName = tt.newName
+						}
+						actual := tasks[0]
+						assert.Equal(t, expectedName, actual.Name)
+						assert.Equal(t, tt.task.Cron, actual.Cron)
+						assert.Equal(t, tt.task.Description, actual.Description)
+						assert.Equal(t, tt.task.Every, actual.Every)
+						assert.Equal(t, durToStr(tt.task.Offset), actual.Offset)
+
+						expectedQuery := `from(bucket: "rucket") |> yield()`
+						assert.Equal(t, expectedQuery, actual.Query)
+					}
+					t.Run(tt.name, fn)
+				}
+			})
+
 			t.Run("variable", func(t *testing.T) {
 				tests := []struct {
 					name        string
@@ -1617,6 +2532,24 @@ func TestService(t *testing.T) {
 				return &influxdb.Bucket{ID: 1, Name: "bucket"}, nil
 			}
 
+			checkSVC := mock.NewCheckService()
+			expectedCheck := &icheck.Deadman{
+				Base:       newThresholdBase(1),
+				TimeSince:  mustDuration(t, time.Hour),
+				StaleTime:  mustDuration(t, 5*time.Hour),
+				ReportZero: true,
+				Level:      notification.Critical,
+			}
+			checkSVC.FindChecksFn = func(ctx context.Context, f influxdb.CheckFilter, _ ...influxdb.FindOptions) ([]influxdb.Check, int, error) {
+				if f.OrgID == nil || *f.OrgID != orgID {
+					return nil, 0, errors.New("not suppose to get here")
+				}
+				return []influxdb.Check{expectedCheck}, 1, nil
+			}
+			checkSVC.FindCheckByIDFn = func(ctx context.Context, id influxdb.ID) (influxdb.Check, error) {
+				return expectedCheck, nil
+			}
+
 			dashSVC := mock.NewDashboardService()
 			dashSVC.FindDashboardsF = func(_ context.Context, f influxdb.DashboardFilter, _ influxdb.FindOptions) ([]*influxdb.Dashboard, int, error) {
 				if f.OrganizationID == nil || *f.OrganizationID != orgID {
@@ -1639,6 +2572,55 @@ func TestService(t *testing.T) {
 				}, nil
 			}
 
+			endpointSVC := mock.NewNotificationEndpointService()
+			endpointSVC.FindNotificationEndpointsF = func(ctx context.Context, f influxdb.NotificationEndpointFilter, _ ...influxdb.FindOptions) ([]influxdb.NotificationEndpoint, int, error) {
+				id := influxdb.ID(2)
+				endpoints := []influxdb.NotificationEndpoint{
+					&endpoint.HTTP{
+						Base: endpoint.Base{
+							ID:   &id,
+							Name: "http",
+						},
+						URL:        "http://example.com",
+						Username:   influxdb.SecretField{Key: id.String() + "-username"},
+						Password:   influxdb.SecretField{Key: id.String() + "-password"},
+						AuthMethod: "basic",
+						Method:     "POST",
+					},
+				}
+				return endpoints, len(endpoints), nil
+			}
+			endpointSVC.FindNotificationEndpointByIDF = func(ctx context.Context, id influxdb.ID) (influxdb.NotificationEndpoint, error) {
+				return &endpoint.HTTP{
+					Base: endpoint.Base{
+						ID:   &id,
+						Name: "http",
+					},
+					URL:        "http://example.com",
+					Username:   influxdb.SecretField{Key: id.String() + "-username"},
+					Password:   influxdb.SecretField{Key: id.String() + "-password"},
+					AuthMethod: "basic",
+					Method:     "POST",
+				}, nil
+			}
+
+			ruleSVC := mock.NewNotificationRuleStore()
+			ruleSVC.FindNotificationRulesF = func(ctx context.Context, f influxdb.NotificationRuleFilter, _ ...influxdb.FindOptions) ([]influxdb.NotificationRule, int, error) {
+				out := []influxdb.NotificationRule{&rule.HTTP{Base: rule.Base{ID: 91}}}
+				return out, len(out), nil
+			}
+			ruleSVC.FindNotificationRuleByIDF = func(ctx context.Context, id influxdb.ID) (influxdb.NotificationRule, error) {
+				return &rule.HTTP{
+					Base: rule.Base{
+						ID:          id,
+						Name:        "rule_0",
+						EndpointID:  2,
+						Every:       mustDuration(t, time.Minute),
+						StatusRules: []notification.StatusRule{{CurrentLevel: notification.Critical}},
+					},
+				}, nil
+			}
+
 			labelSVC := mock.NewLabelService()
 			labelSVC.FindLabelsFn = func(_ context.Context, f influxdb.LabelFilter) ([]*influxdb.Label, error) {
 				if f.OrgID == nil || *f.OrgID != orgID {
@@ -1651,6 +2633,28 @@ func TestService(t *testing.T) {
 					return nil, errors.New("wrong id")
 				}
 				return &influxdb.Label{ID: 3, Name: "label"}, nil
+			}
+
+			taskSVC := mock.NewTaskService()
+			taskSVC.FindTasksFn = func(ctx context.Context, f influxdb.TaskFilter) ([]*influxdb.Task, int, error) {
+				return []*influxdb.Task{
+					{ID: 31},
+					{ID: expectedCheck.TaskID},              // this one should be ignored in the return
+					{ID: 99, Type: influxdb.TaskSystemType}, // this one should be skipped since it is a system task
+				}, 3, nil
+			}
+			taskSVC.FindTaskByIDFn = func(ctx context.Context, id influxdb.ID) (*influxdb.Task, error) {
+				if id != 31 {
+					return nil, errors.New("wrong id: " + id.String())
+				}
+				return &influxdb.Task{
+					ID:     id,
+					Name:   "task_0",
+					Every:  time.Minute.String(),
+					Offset: 10 * time.Second,
+					Type:   influxdb.TaskSystemType,
+					Flux:   `option task = { name: "larry" } from(bucket: "rucket") |> yield()`,
+				}, nil
 			}
 
 			varSVC := mock.NewVariableService()
@@ -1669,29 +2673,60 @@ func TestService(t *testing.T) {
 
 			svc := newTestService(
 				WithBucketSVC(bktSVC),
+				WithCheckSVC(checkSVC),
 				WithDashboardSVC(dashSVC),
 				WithLabelSVC(labelSVC),
+				WithNotificationEndpointSVC(endpointSVC),
+				WithNotificationRuleSVC(ruleSVC),
+				WithTaskSVC(taskSVC),
 				WithVariableSVC(varSVC),
 			)
 
 			pkg, err := svc.CreatePkg(context.TODO(), CreateWithAllOrgResources(orgID))
 			require.NoError(t, err)
 
-			bkts := pkg.Summary().Buckets
+			summary := pkg.Summary()
+			bkts := summary.Buckets
 			require.Len(t, bkts, 1)
 			assert.Equal(t, "bucket", bkts[0].Name)
 
-			dashs := pkg.Summary().Dashboards
+			checks := summary.Checks
+			require.Len(t, checks, 1)
+			assert.Equal(t, "check_1", checks[0].Check.GetName())
+
+			dashs := summary.Dashboards
 			require.Len(t, dashs, 1)
 			assert.Equal(t, "dashboard", dashs[0].Name)
 
-			labels := pkg.Summary().Labels
+			labels := summary.Labels
 			require.Len(t, labels, 1)
 			assert.Equal(t, "label", labels[0].Name)
 
-			vars := pkg.Summary().Variables
+			endpoints := summary.NotificationEndpoints
+			require.Len(t, endpoints, 1)
+			assert.Equal(t, "http", endpoints[0].NotificationEndpoint.GetName())
+
+			rules := summary.NotificationRules
+			require.Len(t, rules, 1)
+			assert.Equal(t, "rule_0", rules[0].Name)
+			assert.Equal(t, "http", rules[0].EndpointName)
+
+			require.Len(t, summary.Tasks, 1)
+			task1 := summary.Tasks[0]
+			assert.Equal(t, "task_0", task1.Name)
+
+			vars := summary.Variables
 			require.Len(t, vars, 1)
 			assert.Equal(t, "variable", vars[0].Name)
 		})
 	})
+}
+
+func newTestIDPtr(i int) *influxdb.ID {
+	id := influxdb.ID(i)
+	return &id
+}
+
+func levelPtr(l notification.CheckLevel) *notification.CheckLevel {
+	return &l
 }

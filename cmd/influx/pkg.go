@@ -42,18 +42,22 @@ type cmdPkgBuilder struct {
 	hasColor        bool
 	hasTableBorders bool
 	meta            pkger.Metadata
-	orgID           string
-	org             string
+	org             organization
 	quiet           bool
 
 	applyOpts struct {
-		force string
+		force   string
+		secrets []string
 	}
 	exportOpts struct {
 		resourceType string
 		buckets      string
+		checks       string
 		dashboards   string
+		endpoints    string
 		labels       string
+		rules        string
+		tasks        string
 		telegrafs    string
 		variables    string
 	}
@@ -92,31 +96,24 @@ func (b *cmdPkgBuilder) cmdPkgApply() *cobra.Command {
 	cmd.Flags().StringVarP(&b.file, "file", "f", "", "Path to package file")
 	cmd.MarkFlagFilename("file", "yaml", "yml", "json")
 	cmd.Flags().BoolVarP(&b.quiet, "quiet", "q", false, "disable output printing")
-	cmd.Flags().StringVar(&b.applyOpts.force, "force", "", `TTY input, if package will have destructive changes, proceed if set "true".`)
+	cmd.Flags().StringVar(&b.applyOpts.force, "force", "", `TTY input, if package will have destructive changes, proceed if set "true"`)
 
-	cmd.Flags().StringVarP(&b.orgID, "org-id", "", "", "The ID of the organization that owns the bucket")
-	cmd.Flags().StringVarP(&b.org, "org", "o", "", "The name of the organization that owns the bucket")
+	b.org.register(cmd)
 
 	cmd.Flags().BoolVarP(&b.hasColor, "color", "c", true, "Enable color in output, defaults true")
 	cmd.Flags().BoolVar(&b.hasTableBorders, "table-borders", true, "Enable table borders, defaults true")
+
+	b.applyOpts.secrets = []string{}
+	cmd.Flags().StringSliceVar(&b.applyOpts.secrets, "secret", nil, "Secrets to provide alongside the package; format should --secret=SECRET_KEY::SECRET_VALUE --secret=SECRET_KEY_2::SECRET_VALUE_2")
 
 	cmd.RunE = b.pkgApplyRunEFn()
 
 	return cmd
 }
 
-func (b *cmdPkgBuilder) validOrgFlags() error {
-	if b.orgID == "" && b.org == "" {
-		return fmt.Errorf("must specify org-id, or org name")
-	} else if b.orgID != "" && b.org != "" {
-		return fmt.Errorf("must specify org-id, or org name not both")
-	}
-	return nil
-}
-
 func (b *cmdPkgBuilder) pkgApplyRunEFn() func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) (e error) {
-		if err := b.validOrgFlags(); err != nil {
+		if err := b.org.validOrgFlags(); err != nil {
 			return err
 		}
 		color.NoColor = !b.hasColor
@@ -126,7 +123,11 @@ func (b *cmdPkgBuilder) pkgApplyRunEFn() func(*cobra.Command, []string) error {
 			return err
 		}
 
-		influxOrgID, err := getOrgID(orgSVC, b.orgID, b.org)
+		if err := b.org.validOrgFlags(); err != nil {
+			return err
+		}
+
+		influxOrgID, err := b.org.getID(orgSVC)
 		if err != nil {
 			return nil
 		}
@@ -136,9 +137,40 @@ func (b *cmdPkgBuilder) pkgApplyRunEFn() func(*cobra.Command, []string) error {
 			return err
 		}
 
-		_, diff, err := svc.DryRun(context.Background(), influxOrgID, 0, pkg)
+		drySum, diff, err := svc.DryRun(context.Background(), influxOrgID, 0, pkg)
 		if err != nil {
 			return err
+		}
+
+		providedSecrets := make(map[string]string)
+		for _, secretKey := range drySum.MissingSecrets {
+			providedSecrets[secretKey] = ""
+		}
+		for _, secretPair := range b.applyOpts.secrets {
+			pieces := strings.Split(secretPair, "::")
+			if len(pieces) < 2 {
+				continue
+			}
+			providedSecrets[pieces[0]] = pieces[1]
+		}
+
+		if !isTTY {
+			for secretKey, existinVal := range providedSecrets {
+				if existinVal != "" {
+					continue
+				}
+				ui := &input.UI{
+					Writer: os.Stdout,
+					Reader: os.Stdin,
+				}
+
+				const skipDefault = "skip-this-key"
+				prompt := "Please provide secret value for key " + secretKey + " (optional, press enter to skip)"
+				secretVal := getInput(ui, prompt, skipDefault)
+				if secretVal != "" && secretVal != skipDefault {
+					providedSecrets[secretKey] = secretVal
+				}
+			}
 		}
 
 		if !b.quiet {
@@ -163,7 +195,7 @@ func (b *cmdPkgBuilder) pkgApplyRunEFn() func(*cobra.Command, []string) error {
 			return errors.New("package has conflicts with existing resources and cannot safely apply")
 		}
 
-		summary, err := svc.Apply(context.Background(), influxOrgID, 0, pkg)
+		summary, err := svc.Apply(context.Background(), influxOrgID, 0, pkg, pkger.ApplyWithSecrets(providedSecrets))
 		if err != nil {
 			return err
 		}
@@ -230,8 +262,12 @@ func (b *cmdPkgBuilder) cmdPkgExport() *cobra.Command {
 	cmd.Flags().StringVarP(&b.meta.Version, "version", "v", "", "version for new pkg")
 	cmd.Flags().StringVar(&b.exportOpts.resourceType, "resource-type", "", "The resource type provided will be associated with all IDs via stdin.")
 	cmd.Flags().StringVar(&b.exportOpts.buckets, "buckets", "", "List of bucket ids comma separated")
+	cmd.Flags().StringVar(&b.exportOpts.checks, "checks", "", "List of check ids comma separated")
 	cmd.Flags().StringVar(&b.exportOpts.dashboards, "dashboards", "", "List of dashboard ids comma separated")
+	cmd.Flags().StringVar(&b.exportOpts.endpoints, "endpoints", "", "List of notification endpoint ids comma separated")
 	cmd.Flags().StringVar(&b.exportOpts.labels, "labels", "", "List of label ids comma separated")
+	cmd.Flags().StringVar(&b.exportOpts.rules, "rules", "", "List of notification rule ids comma separated")
+	cmd.Flags().StringVar(&b.exportOpts.tasks, "tasks", "", "List of task ids comma separated")
 	cmd.Flags().StringVar(&b.exportOpts.telegrafs, "telegraf-configs", "", "List of telegraf config ids comma separated")
 	cmd.Flags().StringVar(&b.exportOpts.variables, "variables", "", "List of variable ids comma separated")
 
@@ -254,8 +290,12 @@ func (b *cmdPkgBuilder) pkgExportRunEFn() func(*cobra.Command, []string) error {
 			idStrs []string
 		}{
 			{kind: pkger.KindBucket, idStrs: strings.Split(b.exportOpts.buckets, ",")},
+			{kind: pkger.KindCheck, idStrs: strings.Split(b.exportOpts.checks, ",")},
 			{kind: pkger.KindDashboard, idStrs: strings.Split(b.exportOpts.dashboards, ",")},
 			{kind: pkger.KindLabel, idStrs: strings.Split(b.exportOpts.labels, ",")},
+			{kind: pkger.KindNotificationEndpoint, idStrs: strings.Split(b.exportOpts.endpoints, ",")},
+			{kind: pkger.KindNotificationRule, idStrs: strings.Split(b.exportOpts.rules, ",")},
+			{kind: pkger.KindTask, idStrs: strings.Split(b.exportOpts.tasks, ",")},
 			{kind: pkger.KindTelegraf, idStrs: strings.Split(b.exportOpts.telegrafs, ",")},
 			{kind: pkger.KindVariable, idStrs: strings.Split(b.exportOpts.variables, ",")},
 		}
@@ -297,8 +337,9 @@ func (b *cmdPkgBuilder) cmdPkgExportAll() *cobra.Command {
 	cmd.Short = "Export all existing resources for an organization as a package"
 
 	cmd.Flags().StringVarP(&b.file, "file", "f", "", "output file for created pkg; defaults to std out if no file provided; the extension of provided file (.yml/.json) will dictate encoding")
-	cmd.Flags().StringVarP(&b.orgID, "org-id", "", "", "organization id")
-	cmd.Flags().StringVarP(&b.org, "org", "o", "", "The name of the organization that owns the bucket")
+
+	b.org.register(cmd)
+
 	cmd.Flags().StringVarP(&b.meta.Name, "name", "n", "", "name for new pkg")
 	cmd.Flags().StringVarP(&b.meta.Description, "description", "d", "", "description for new pkg")
 	cmd.Flags().StringVarP(&b.meta.Version, "version", "v", "", "version for new pkg")
@@ -317,7 +358,7 @@ func (b *cmdPkgBuilder) pkgExportAllRunEFn() func(*cobra.Command, []string) erro
 
 		opts := []pkger.CreatePkgSetFn{pkger.CreateWithMetadata(b.meta)}
 
-		orgID, err := getOrgID(orgSVC, b.orgID, b.org)
+		orgID, err := b.org.getID(orgSVC)
 		if err != nil {
 			return err
 		}
@@ -600,6 +641,23 @@ func (b *cmdPkgBuilder) printPkgDiff(diff pkger.Diff) {
 		})
 	}
 
+	if checks := diff.Checks; len(checks) > 0 {
+		headers := []string{"New", "ID", "Name", "Description"}
+		tablePrintFn("CHECKS", headers, len(checks), func(i int) []string {
+			c := checks[i]
+			var oldDesc string
+			if c.Old != nil {
+				oldDesc = c.Old.GetDescription()
+			}
+			return []string{
+				boolDiff(c.IsNew()),
+				c.ID.String(),
+				c.Name,
+				diffLn(c.IsNew(), oldDesc, c.New.GetDescription()),
+			}
+		})
+	}
+
 	if dashes := diff.Dashboards; len(dashes) > 0 {
 		headers := []string{"New", "Name", "Description", "Num Charts"}
 		tablePrintFn("DASHBOARDS", headers, len(dashes), func(i int) []string {
@@ -609,6 +667,64 @@ func (b *cmdPkgBuilder) printPkgDiff(diff pkger.Diff) {
 				d.Name,
 				green(d.Desc),
 				green(strconv.Itoa(len(d.Charts))),
+			}
+		})
+	}
+
+	if endpoints := diff.NotificationEndpoints; len(endpoints) > 0 {
+		headers := []string{"New", "ID", "Name"}
+		tablePrintFn("NOTIFICATION ENDPOINTS", headers, len(endpoints), func(i int) []string {
+			v := endpoints[i]
+			return []string{
+				boolDiff(v.IsNew()),
+				v.ID.String(),
+				v.Name,
+			}
+		})
+	}
+
+	if rules := diff.NotificationRules; len(rules) > 0 {
+		headers := []string{"New", "Name", "Description", "Every", "Offset", "Endpoint Name", "Endpoint ID", "Endpoint Type"}
+		tablePrintFn("NOTIFICATION RULES", headers, len(rules), func(i int) []string {
+			v := rules[i]
+			return []string{
+				green(true),
+				v.Name,
+				v.Description,
+				v.Every,
+				v.Offset,
+				v.EndpointName,
+				v.EndpointID.String(),
+				v.EndpointType,
+			}
+		})
+	}
+
+	if teles := diff.Telegrafs; len(teles) > 0 {
+		headers := []string{"New", "Name", "Description"}
+		tablePrintFn("TELEGRAF CONFIGS", headers, len(teles), func(i int) []string {
+			t := teles[i]
+			return []string{
+				boolDiff(true),
+				t.Name,
+				green(t.Description),
+			}
+		})
+	}
+
+	if tasks := diff.Tasks; len(tasks) > 0 {
+		headers := []string{"New", "Name", "Description", "Cycle"}
+		tablePrintFn("TASKS", headers, len(tasks), func(i int) []string {
+			t := tasks[i]
+			timing := fmt.Sprintf("every: %s offset: %s", t.Every, t.Offset)
+			if t.Cron != "" {
+				timing = t.Cron
+			}
+			return []string{
+				boolDiff(true),
+				t.Name,
+				green(t.Description),
+				green(timing),
 			}
 		})
 	}
@@ -636,30 +752,6 @@ func (b *cmdPkgBuilder) printPkgDiff(diff pkger.Diff) {
 				diffLn(v.IsNew(), old.Description, v.New.Description),
 				diffLn(v.IsNew(), oldArgType, newArgType),
 				diffLn(v.IsNew(), printVarArgs(old.Args), printVarArgs(v.New.Args)),
-			}
-		})
-	}
-
-	if endpoints := diff.NotificationEndpoints; len(endpoints) > 0 {
-		headers := []string{"New", "ID", "Name"}
-		tablePrintFn("NOTIFICATION ENDPOINTS", headers, len(endpoints), func(i int) []string {
-			v := endpoints[i]
-			return []string{
-				boolDiff(v.IsNew()),
-				v.ID.String(),
-				v.Name,
-			}
-		})
-	}
-
-	if teles := diff.Telegrafs; len(diff.Telegrafs) > 0 {
-		headers := []string{"New", "Name", "Description"}
-		tablePrintFn("TELEGRAF CONFIGS", headers, len(teles), func(i int) []string {
-			t := teles[i]
-			return []string{
-				boolDiff(true),
-				t.Name,
-				green(t.Description),
 			}
 		})
 	}
@@ -708,11 +800,82 @@ func (b *cmdPkgBuilder) printPkgSummary(sum pkger.Summary) {
 		})
 	}
 
+	if checks := sum.Checks; len(checks) > 0 {
+		headers := []string{"ID", "Name", "Description"}
+		tablePrintFn("CHECKS", headers, len(checks), func(i int) []string {
+			c := checks[i].Check
+			return []string{
+				c.GetID().String(),
+				c.GetName(),
+				c.GetDescription(),
+			}
+		})
+	}
+
 	if dashes := sum.Dashboards; len(dashes) > 0 {
 		headers := []string{"ID", "Name", "Description"}
 		tablePrintFn("DASHBOARDS", headers, len(dashes), func(i int) []string {
 			d := dashes[i]
 			return []string{d.ID.String(), d.Name, d.Description}
+		})
+	}
+
+	if endpoints := sum.NotificationEndpoints; len(endpoints) > 0 {
+		headers := []string{"ID", "Name", "Description", "Status"}
+		tablePrintFn("NOTIFICATION ENDPOINTS", headers, len(endpoints), func(i int) []string {
+			v := endpoints[i]
+			return []string{
+				v.NotificationEndpoint.GetID().String(),
+				v.NotificationEndpoint.GetName(),
+				v.NotificationEndpoint.GetDescription(),
+				string(v.NotificationEndpoint.GetStatus()),
+			}
+		})
+	}
+
+	if rules := sum.NotificationRules; len(rules) > 0 {
+		headers := []string{"ID", "Name", "Description", "Every", "Offset", "Endpoint Name", "Endpoint ID", "Endpoint Type"}
+		tablePrintFn("NOTIFICATION RULES", headers, len(rules), func(i int) []string {
+			v := rules[i]
+			return []string{
+				v.ID.String(),
+				v.Name,
+				v.Description,
+				v.Every,
+				v.Offset,
+				v.EndpointName,
+				v.EndpointID.String(),
+				v.EndpointType,
+			}
+		})
+	}
+
+	if tasks := sum.Tasks; len(tasks) > 0 {
+		headers := []string{"ID", "Name", "Description", "Cycle"}
+		tablePrintFn("TASKS", headers, len(tasks), func(i int) []string {
+			t := tasks[i]
+			timing := fmt.Sprintf("every: %s offset: %s", t.Every, t.Offset)
+			if t.Cron != "" {
+				timing = t.Cron
+			}
+			return []string{
+				t.ID.String(),
+				t.Name,
+				t.Description,
+				timing,
+			}
+		})
+	}
+
+	if teles := sum.TelegrafConfigs; len(teles) > 0 {
+		headers := []string{"ID", "Name", "Description"}
+		tablePrintFn("TELEGRAF CONFIGS", headers, len(teles), func(i int) []string {
+			t := teles[i]
+			return []string{
+				t.TelegrafConfig.ID.String(),
+				t.TelegrafConfig.Name,
+				t.TelegrafConfig.Description,
+			}
 		})
 	}
 
@@ -731,31 +894,6 @@ func (b *cmdPkgBuilder) printPkgSummary(sum pkger.Summary) {
 		})
 	}
 
-	if endpoints := sum.NotificationEndpoints; len(endpoints) > 0 {
-		headers := []string{"ID", "Name", "Description", "Status"}
-		tablePrintFn("NOTIFICATION ENDPOINTS", headers, len(endpoints), func(i int) []string {
-			v := endpoints[i]
-			return []string{
-				v.NotificationEndpoint.GetID().String(),
-				v.NotificationEndpoint.GetName(),
-				v.NotificationEndpoint.GetDescription(),
-				string(v.NotificationEndpoint.GetStatus()),
-			}
-		})
-	}
-
-	if teles := sum.TelegrafConfigs; len(teles) > 0 {
-		headers := []string{"ID", "Name", "Description"}
-		tablePrintFn("TELEGRAF CONFIGS", headers, len(teles), func(i int) []string {
-			t := teles[i]
-			return []string{
-				t.TelegrafConfig.ID.String(),
-				t.TelegrafConfig.Name,
-				t.TelegrafConfig.Description,
-			}
-		})
-	}
-
 	if mappings := sum.LabelMappings; len(mappings) > 0 {
 		headers := []string{"Resource Type", "Resource Name", "Resource ID", "Label Name", "Label ID"}
 		tablePrintFn("LABEL MAPPINGS", headers, len(mappings), func(i int) []string {
@@ -767,6 +905,13 @@ func (b *cmdPkgBuilder) printPkgSummary(sum pkger.Summary) {
 				m.LabelName,
 				m.LabelID.String(),
 			}
+		})
+	}
+
+	if secrets := sum.MissingSecrets; len(secrets) > 0 {
+		headers := []string{"Secret Key"}
+		tablePrintFn("MISSING SECRETS", headers, len(secrets), func(i int) []string {
+			return []string{secrets[i]}
 		})
 	}
 }
@@ -803,8 +948,12 @@ func tablePrinter(wr io.Writer, table string, headers []string, count int, hasCo
 	}
 
 	footers := make([]string, len(headers))
-	footers[len(footers)-2] = "TOTAL"
-	footers[len(footers)-1] = strconv.Itoa(count)
+	if len(headers) > 1 {
+		footers[len(footers)-2] = "TOTAL"
+		footers[len(footers)-1] = strconv.Itoa(count)
+	} else {
+		footers[0] = "TOTAL: " + strconv.Itoa(count)
+	}
 	w.SetFooter(footers)
 	if hasColor {
 		var colors []tablewriter.Colors
@@ -812,8 +961,12 @@ func tablePrinter(wr io.Writer, table string, headers []string, count int, hasCo
 			colors = append(colors, tablewriter.Color(tablewriter.FgHiCyanColor))
 		}
 		w.SetHeaderColor(colors...)
-		colors[len(colors)-2] = tablewriter.Color(tablewriter.FgHiBlueColor)
-		colors[len(colors)-1] = tablewriter.Color(tablewriter.FgHiBlueColor)
+		if len(headers) > 1 {
+			colors[len(colors)-2] = tablewriter.Color(tablewriter.FgHiBlueColor)
+			colors[len(colors)-1] = tablewriter.Color(tablewriter.FgHiBlueColor)
+		} else {
+			colors[0] = tablewriter.Color(tablewriter.FgHiBlueColor)
+		}
 		w.SetFooterColor(colors...)
 	}
 

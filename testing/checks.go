@@ -31,7 +31,7 @@ const (
 	checkTwoID = "020f755c3c082001"
 )
 
-var script = `data = from(bucket: "telegraf") |> range(start: -1m)`
+var script = `data = from(bucket: "telegraf") |> range(start: -1m) |> filter(fn: (r) => r._field == "usage_user")`
 
 var deadman1 = &check.Deadman{
 	Base: check.Base{
@@ -44,6 +44,7 @@ var deadman1 = &check.Deadman{
 		Query: influxdb.DashboardQuery{
 			Text: script,
 			BuilderConfig: influxdb.BuilderConfig{
+				Buckets: []string{},
 				Tags: []struct {
 					Key    string   `json:"key"`
 					Values []string `json:"values"`
@@ -53,6 +54,9 @@ var deadman1 = &check.Deadman{
 						Values: []string{"usage_user"},
 					},
 				},
+				Functions: []struct {
+					Name string `json:"name"`
+				}{},
 			},
 		},
 		Every:                 mustDuration("1m"),
@@ -85,15 +89,14 @@ var threshold1 = &check.Threshold{
 		Query: influxdb.DashboardQuery{
 			Text: script,
 			BuilderConfig: influxdb.BuilderConfig{
+				Buckets: []string{},
 				Tags: []struct {
 					Key    string   `json:"key"`
 					Values []string `json:"values"`
-				}{
-					{
-						Key:    "_field",
-						Values: []string{"usage_user"},
-					},
-				},
+				}{},
+				Functions: []struct {
+					Name string `json:"name"`
+				}{},
 			},
 		},
 		Tags: []influxdb.Tag{
@@ -321,6 +324,7 @@ func CreateCheck(
 							Query: influxdb.DashboardQuery{
 								Text: script,
 								BuilderConfig: influxdb.BuilderConfig{
+									Buckets: []string{},
 									Tags: []struct {
 										Key    string   `json:"key"`
 										Values []string `json:"values"`
@@ -330,6 +334,9 @@ func CreateCheck(
 											Values: []string{"usage_user"},
 										},
 									},
+									Functions: []struct {
+										Name string `json:"name"`
+									}{},
 								},
 							},
 							Every:                 mustDuration("1m"),
@@ -407,17 +414,6 @@ func CreateCheck(
 						Every:                 mustDuration("1m"),
 						Query: influxdb.DashboardQuery{
 							Text: script,
-							BuilderConfig: influxdb.BuilderConfig{
-								Tags: []struct {
-									Key    string   `json:"key"`
-									Values []string `json:"values"`
-								}{
-									{
-										Key:    "_field",
-										Values: []string{"usage_user"},
-									},
-								},
-							},
 						},
 						Tags: []influxdb.Tag{
 							{Key: "k11", Value: "v11"},
@@ -659,6 +655,7 @@ func CreateCheck(
 							Query: influxdb.DashboardQuery{
 								Text: script,
 								BuilderConfig: influxdb.BuilderConfig{
+									Buckets: []string{},
 									Tags: []struct {
 										Key    string   `json:"key"`
 										Values []string `json:"values"`
@@ -668,6 +665,9 @@ func CreateCheck(
 											Values: []string{"usage_user"},
 										},
 									},
+									Functions: []struct {
+										Name string `json:"name"`
+									}{},
 								},
 							},
 							OwnerID:               MustIDBase16(twoID),
@@ -1761,6 +1761,7 @@ data = from(bucket: "telegraf") |> range(start: -1m)`,
 						Query: influxdb.DashboardQuery{
 							Text: script,
 							BuilderConfig: influxdb.BuilderConfig{
+								Buckets: []string{},
 								Tags: []struct {
 									Key    string   `json:"key"`
 									Values []string `json:"values"`
@@ -1770,6 +1771,9 @@ data = from(bucket: "telegraf") |> range(start: -1m)`,
 										Values: []string{"usage_user"},
 									},
 								},
+								Functions: []struct {
+									Name string `json:"name"`
+								}{},
 							},
 						},
 						StatusMessageTemplate: "msg1",

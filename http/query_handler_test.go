@@ -15,8 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/kit/tracing"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/influxdata/flux"
 	"github.com/influxdata/flux/csv"
@@ -27,6 +25,7 @@ import (
 	"github.com/influxdata/influxdb/http/metric"
 	"github.com/influxdata/influxdb/inmem"
 	"github.com/influxdata/influxdb/kit/check"
+	tracetesting "github.com/influxdata/influxdb/kit/tracing/testing"
 	influxmock "github.com/influxdata/influxdb/mock"
 	"github.com/influxdata/influxdb/query"
 	"github.com/influxdata/influxdb/query/mock"
@@ -245,7 +244,7 @@ func TestFluxHandler_postFluxAST(t *testing.T) {
 			name: "get ast from()",
 			w:    httptest.NewRecorder(),
 			r:    httptest.NewRequest("POST", "/api/v2/query/ast", bytes.NewBufferString(`{"query": "from()"}`)),
-			want: `{"ast":{"type":"Package","package":"main","files":[{"type":"File","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":7},"source":"from()"},"metadata":"parser-type=go","package":null,"imports":null,"body":[{"type":"ExpressionStatement","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":7},"source":"from()"},"expression":{"type":"CallExpression","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":7},"source":"from()"},"callee":{"type":"Identifier","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":5},"source":"from"},"name":"from"}}}]}]}}
+			want: `{"ast":{"type":"Package","package":"main","files":[{"type":"File","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":7},"source":"from()"},"metadata":"parser-type=rust","package":null,"imports":null,"body":[{"type":"ExpressionStatement","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":7},"source":"from()"},"expression":{"type":"CallExpression","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":7},"source":"from()"},"callee":{"type":"Identifier","location":{"start":{"line":1,"column":1},"end":{"line":1,"column":5},"source":"from"},"name":"from"}}}]}]}}
 `,
 			status: http.StatusOK,
 		},
@@ -323,7 +322,7 @@ var _ metric.EventRecorder = noopEventRecorder{}
 
 // Certain error cases must be encoded as influxdb.Error so they can be properly decoded clientside.
 func TestFluxHandler_PostQuery_Errors(t *testing.T) {
-	defer tracing.JaegerTestSetupAndTeardown(t.Name())()
+	defer tracetesting.SetupInMemoryTracing(t.Name())()
 
 	i := inmem.NewService()
 	b := &FluxBackend{

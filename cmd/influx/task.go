@@ -32,21 +32,17 @@ func taskF(cmd *cobra.Command, args []string) error {
 var logCmd = &cobra.Command{
 	Use:   "log",
 	Short: "Log related commands",
-	Run:   logF,
-}
-
-func logF(cmd *cobra.Command, args []string) {
-	cmd.Usage()
+	Run: func(cmd *cobra.Command, args []string) {
+		cmd.Usage()
+	},
 }
 
 var runCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Run related commands",
-	Run:   runF,
-}
-
-func runF(cmd *cobra.Command, args []string) {
-	cmd.Usage()
+	Run: func(cmd *cobra.Command, args []string) {
+		cmd.Usage()
+	},
 }
 
 func init() {
@@ -54,13 +50,9 @@ func init() {
 	taskCmd.AddCommand(logCmd)
 }
 
-// TaskCreateFlags define the Create Command
-type TaskCreateFlags struct {
-	org   string
-	orgID string
+var taskCreateFlags struct {
+	organization
 }
-
-var taskCreateFlags TaskCreateFlags
 
 func init() {
 	taskCreateCmd := &cobra.Command{
@@ -70,16 +62,15 @@ func init() {
 		RunE:  wrapCheckSetup(taskCreateF),
 	}
 
-	taskCreateCmd.Flags().StringVarP(&taskCreateFlags.org, "org", "o", "", "organization name")
-	taskCreateCmd.Flags().StringVarP(&taskCreateFlags.orgID, "org-id", "", "", "id of the organization that owns the task")
+	taskCreateFlags.organization.register(taskCreateCmd)
 	taskCreateCmd.MarkFlagRequired("flux")
 
 	taskCmd.AddCommand(taskCreateCmd)
 }
 
 func taskCreateF(cmd *cobra.Command, args []string) error {
-	if taskCreateFlags.org != "" && taskCreateFlags.orgID != "" {
-		return fmt.Errorf("must specify exactly one of org or org-id")
+	if err := taskCreateFlags.organization.validOrgFlags(); err != nil {
+		return err
 	}
 
 	s := &http.TaskService{
@@ -95,14 +86,18 @@ func taskCreateF(cmd *cobra.Command, args []string) error {
 
 	tc := platform.TaskCreate{
 		Flux:         flux,
-		Organization: taskCreateFlags.org,
+		Organization: taskCreateFlags.organization.name,
 	}
-	if taskCreateFlags.orgID != "" {
-		oid, err := platform.IDFromString(taskCreateFlags.orgID)
+	if taskCreateFlags.organization.id != "" || taskCreateFlags.organization.name != "" {
+		svc, err := newOrganizationService()
+		if err != nil {
+			return nil
+		}
+		oid, err := taskCreateFlags.organization.getID(svc)
 		if err != nil {
 			return fmt.Errorf("error parsing organization ID: %s", err)
 		}
-		tc.OrganizationID = *oid
+		tc.OrganizationID = oid
 	}
 
 	t, err := s.CreateTask(context.Background(), tc)
@@ -135,16 +130,13 @@ func taskCreateF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// taskFindFlags define the Find Command
-type TaskFindFlags struct {
-	user  string
-	id    string
-	org   string
-	orgID string
-	limit int
+var taskFindFlags struct {
+	user    string
+	id      string
+	limit   int
+	headers bool
+	organization
 }
-
-var taskFindFlags TaskFindFlags
 
 func init() {
 	taskFindCmd := &cobra.Command{
@@ -155,18 +147,16 @@ func init() {
 
 	taskFindCmd.Flags().StringVarP(&taskFindFlags.id, "id", "i", "", "task ID")
 	taskFindCmd.Flags().StringVarP(&taskFindFlags.user, "user-id", "n", "", "task owner ID")
-	taskFindCmd.Flags().StringVarP(&taskFindFlags.org, "org", "o", "", "task organization name")
-	taskFindCmd.Flags().StringVarP(&taskFindFlags.orgID, "org-id", "", "", "task organization ID")
+	taskFindFlags.organization.register(taskFindCmd)
 	taskFindCmd.Flags().IntVarP(&taskFindFlags.limit, "limit", "", platform.TaskDefaultPageSize, "the number of tasks to find")
+	taskFindCmd.Flags().BoolVar(&taskFindFlags.headers, "headers", true, "To print the table headers; defaults true")
 
 	taskCmd.AddCommand(taskFindCmd)
 }
 
 func taskFindF(cmd *cobra.Command, args []string) error {
-	if taskFindFlags.orgID == "" && taskFindFlags.org == "" {
-		return fmt.Errorf("must specify org-id, or org name")
-	} else if taskFindFlags.orgID != "" && taskFindFlags.org != "" {
-		return fmt.Errorf("must specify org-id, or org name not both")
+	if err := taskFindFlags.organization.validOrgFlags(); err != nil {
+		return err
 	}
 	s := &http.TaskService{
 		Addr:               flags.host,
@@ -183,11 +173,11 @@ func taskFindF(cmd *cobra.Command, args []string) error {
 		filter.User = id
 	}
 
-	if taskFindFlags.org != "" {
-		filter.Organization = taskFindFlags.org
+	if taskFindFlags.organization.name != "" {
+		filter.Organization = taskFindFlags.organization.name
 	}
-	if taskFindFlags.orgID != "" {
-		id, err := platform.IDFromString(taskFindFlags.orgID)
+	if taskFindFlags.organization.id != "" {
+		id, err := platform.IDFromString(taskFindFlags.organization.id)
 		if err != nil {
 			return err
 		}
@@ -222,6 +212,7 @@ func taskFindF(cmd *cobra.Command, args []string) error {
 	}
 
 	w := internal.NewTabWriter(os.Stdout)
+	w.HideHeaders(!taskFindFlags.headers)
 	w.WriteHeaders(
 		"ID",
 		"Name",
@@ -248,13 +239,10 @@ func taskFindF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// taskUpdateFlags define the Update Command
-type TaskUpdateFlags struct {
+var taskUpdateFlags struct {
 	id     string
 	status string
 }
-
-var taskUpdateFlags TaskUpdateFlags
 
 func init() {
 	taskUpdateCmd := &cobra.Command{
@@ -325,12 +313,9 @@ func taskUpdateF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// taskDeleteFlags define the Delete command
-type TaskDeleteFlags struct {
+var taskDeleteFlags struct {
 	id string
 }
-
-var taskDeleteFlags TaskDeleteFlags
 
 func init() {
 	taskDeleteCmd := &cobra.Command{
@@ -393,13 +378,10 @@ func taskDeleteF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// taskLogFindFlags define the Delete command
-type TaskLogFindFlags struct {
+var taskLogFindFlags struct {
 	taskID string
 	runID  string
 }
-
-var taskLogFindFlags TaskLogFindFlags
 
 func init() {
 	taskLogFindCmd := &cobra.Command{
@@ -461,16 +443,13 @@ func taskLogFindF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// taskLogFindFlags define the Delete command
-type TaskRunFindFlags struct {
+var taskRunFindFlags struct {
 	runID      string
 	taskID     string
 	afterTime  string
 	beforeTime string
 	limit      int
 }
-
-var taskRunFindFlags TaskRunFindFlags
 
 func init() {
 	taskRunFindCmd := &cobra.Command{
@@ -558,11 +537,9 @@ func taskRunFindF(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-type RunRetryFlags struct {
+var runRetryFlags struct {
 	taskID, runID string
 }
-
-var runRetryFlags RunRetryFlags
 
 func init() {
 	cmd := &cobra.Command{

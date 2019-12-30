@@ -3,12 +3,14 @@ package launcher_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/cmd/influxd/launcher"
 	"github.com/influxdata/influxdb/mock"
+	"github.com/influxdata/influxdb/notification/check"
 	"github.com/influxdata/influxdb/pkger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,11 +42,14 @@ func TestLauncher_Pkger(t *testing.T) {
 		svc := pkger.NewService(
 			pkger.WithBucketSVC(l.BucketService(t)),
 			pkger.WithDashboardSVC(l.DashboardService(t)),
+			pkger.WithCheckSVC(l.CheckService()),
 			pkger.WithLabelSVC(&fakeLabelSVC{
 				LabelService: l.LabelService(t),
 				killCount:    2, // hits error on 3rd attempt at creating a mapping
 			}),
-			pkger.WithNoticationEndpointSVC(l.NotificationEndpointService(t)),
+			pkger.WithNotificationEndpointSVC(l.NotificationEndpointService(t)),
+			pkger.WithNotificationRuleSVC(l.NotificationRuleService()),
+			pkger.WithTaskSVC(l.TaskServiceKV()),
 			pkger.WithTelegrafSVC(l.TelegrafService(t)),
 			pkger.WithVariableSVC(l.VariableService(t)),
 		)
@@ -78,6 +83,18 @@ func TestLauncher_Pkger(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, endpoints)
 
+		rules, _, err := l.NotificationRuleService().FindNotificationRules(ctx, influxdb.NotificationRuleFilter{
+			OrgID: &l.Org.ID,
+		})
+		require.NoError(t, err)
+		assert.Empty(t, rules)
+
+		tasks, _, err := l.TaskServiceKV().FindTasks(ctx, influxdb.TaskFilter{
+			OrganizationID: &l.Org.ID,
+		})
+		require.NoError(t, err)
+		assert.Empty(t, tasks)
+
 		teles, _, err := l.TelegrafService(t).FindTelegrafConfigs(ctx, influxdb.TelegrafConfigFilter{
 			OrgID: &l.Org.ID,
 		})
@@ -91,9 +108,6 @@ func TestLauncher_Pkger(t *testing.T) {
 
 	hasLabelAssociations := func(t *testing.T, associations []pkger.SummaryLabel, numAss int, expectedNames ...string) {
 		t.Helper()
-
-		require.Len(t, associations, numAss)
-
 		hasAss := func(t *testing.T, expected string) {
 			t.Helper()
 			for _, ass := range associations {
@@ -104,6 +118,7 @@ func TestLauncher_Pkger(t *testing.T) {
 			require.FailNow(t, "did not find expected association: "+expected)
 		}
 
+		require.Len(t, associations, numAss)
 		for _, expected := range expectedNames {
 			hasAss(t, expected)
 		}
@@ -124,20 +139,27 @@ func TestLauncher_Pkger(t *testing.T) {
 		sum, diff, err := svc.DryRun(ctx, l.Org.ID, l.User.ID, newPkg(t))
 		require.NoError(t, err)
 
-		diffBkts := diff.Buckets
-		require.Len(t, diffBkts, 1)
-		assert.True(t, diffBkts[0].IsNew())
+		require.Len(t, diff.Buckets, 1)
+		assert.True(t, diff.Buckets[0].IsNew())
 
-		diffLabels := diff.Labels
-		require.Len(t, diffLabels, 1)
-		assert.True(t, diffLabels[0].IsNew())
+		require.Len(t, diff.Checks, 2)
+		for _, ch := range diff.Checks {
+			assert.True(t, ch.IsNew())
+		}
 
-		diffVars := diff.Variables
-		require.Len(t, diffVars, 1)
-		assert.True(t, diffVars[0].IsNew())
+		require.Len(t, diff.Labels, 1)
+		assert.True(t, diff.Labels[0].IsNew())
+
+		require.Len(t, diff.Variables, 1)
+		assert.True(t, diff.Variables[0].IsNew())
+
+		require.Len(t, diff.NotificationRules, 1)
+		// the pkg being run here has a relationship with the rule and the endpoint within the pkg.
+		assert.Equal(t, "http", diff.NotificationRules[0].EndpointType)
 
 		require.Len(t, diff.Dashboards, 1)
 		require.Len(t, diff.NotificationEndpoints, 1)
+		require.Len(t, diff.Tasks, 1)
 		require.Len(t, diff.Telegrafs, 1)
 
 		labels := sum.Labels
@@ -148,6 +170,13 @@ func TestLauncher_Pkger(t *testing.T) {
 		require.Len(t, bkts, 1)
 		assert.Equal(t, "rucket_1", bkts[0].Name)
 		hasLabelAssociations(t, bkts[0].LabelAssociations, 1, "label_1")
+
+		checks := sum.Checks
+		require.Len(t, checks, 2)
+		for i, ch := range checks {
+			assert.Equal(t, fmt.Sprintf("check_%d", i), ch.Check.GetName())
+			hasLabelAssociations(t, ch.LabelAssociations, 1, "label_1")
+		}
 
 		dashs := sum.Dashboards
 		require.Len(t, dashs, 1)
@@ -160,6 +189,13 @@ func TestLauncher_Pkger(t *testing.T) {
 		assert.Equal(t, "http_none_auth_notification_endpoint", endpoints[0].NotificationEndpoint.GetName())
 		assert.Equal(t, "http none auth desc", endpoints[0].NotificationEndpoint.GetDescription())
 		hasLabelAssociations(t, endpoints[0].LabelAssociations, 1, "label_1")
+
+		require.Len(t, sum.Tasks, 1)
+		task := sum.Tasks[0]
+		assert.Equal(t, "task_1", task.Name)
+		assert.Equal(t, "desc_1", task.Description)
+		assert.Equal(t, "15 * * * *", task.Cron)
+		hasLabelAssociations(t, task.LabelAssociations, 1, "label_1")
 
 		teles := sum.TelegrafConfigs
 		require.Len(t, teles, 1)
@@ -196,6 +232,14 @@ func TestLauncher_Pkger(t *testing.T) {
 		assert.Equal(t, "rucket_1", bkts[0].Name)
 		hasLabelAssociations(t, bkts[0].LabelAssociations, 1, "label_1")
 
+		checks := sum1.Checks
+		require.Len(t, checks, 2)
+		for i, ch := range checks {
+			assert.NotZero(t, ch.Check.GetID())
+			assert.Equal(t, fmt.Sprintf("check_%d", i), ch.Check.GetName())
+			hasLabelAssociations(t, ch.LabelAssociations, 1, "label_1")
+		}
+
 		dashs := sum1.Dashboards
 		require.Len(t, dashs, 1)
 		assert.NotZero(t, dashs[0].ID)
@@ -213,13 +257,27 @@ func TestLauncher_Pkger(t *testing.T) {
 		assert.Equal(t, influxdb.TaskStatusInactive, string(endpoints[0].NotificationEndpoint.GetStatus()))
 		hasLabelAssociations(t, endpoints[0].LabelAssociations, 1, "label_1")
 
+		require.Len(t, sum1.NotificationRules, 1)
+		rule := sum1.NotificationRules[0]
+		assert.NotZero(t, rule.ID)
+		assert.Equal(t, "rule_0", rule.Name)
+		assert.Equal(t, pkger.SafeID(endpoints[0].NotificationEndpoint.GetID()), rule.EndpointID)
+		assert.Equal(t, "http_none_auth_notification_endpoint", rule.EndpointName)
+		assert.Equal(t, "http", rule.EndpointType)
+
+		require.Len(t, sum1.Tasks, 1)
+		task := sum1.Tasks[0]
+		assert.NotZero(t, task.ID)
+		assert.Equal(t, "task_1", task.Name)
+		assert.Equal(t, "desc_1", task.Description)
+
 		teles := sum1.TelegrafConfigs
 		require.Len(t, teles, 1)
 		assert.NotZero(t, teles[0].TelegrafConfig.ID)
 		assert.Equal(t, l.Org.ID, teles[0].TelegrafConfig.OrgID)
 		assert.Equal(t, "first_tele_config", teles[0].TelegrafConfig.Name)
 		assert.Equal(t, "desc", teles[0].TelegrafConfig.Description)
-		assert.Len(t, teles[0].TelegrafConfig.Plugins, 2)
+		assert.Equal(t, telConf, teles[0].TelegrafConfig.Config)
 
 		vars := sum1.Variables
 		require.Len(t, vars, 1)
@@ -239,17 +297,22 @@ func TestLauncher_Pkger(t *testing.T) {
 				ResourceName: name,
 				LabelName:    labels[0].Name,
 				LabelID:      labels[0].ID,
-				ResourceID:   pkger.SafeID(id),
+				ResourceID:   id,
 				ResourceType: rt,
 			}
 		}
 
 		mappings := sum1.LabelMappings
-		require.Len(t, mappings, 5)
+		require.Len(t, mappings, 9)
 		hasMapping(t, mappings, newSumMapping(bkts[0].ID, bkts[0].Name, influxdb.BucketsResourceType))
+		hasMapping(t, mappings, newSumMapping(pkger.SafeID(checks[0].Check.GetID()), checks[0].Check.GetName(), influxdb.ChecksResourceType))
+		hasMapping(t, mappings, newSumMapping(pkger.SafeID(checks[1].Check.GetID()), checks[1].Check.GetName(), influxdb.ChecksResourceType))
 		hasMapping(t, mappings, newSumMapping(dashs[0].ID, dashs[0].Name, influxdb.DashboardsResourceType))
-		hasMapping(t, mappings, newSumMapping(vars[0].ID, vars[0].Name, influxdb.VariablesResourceType))
+		hasMapping(t, mappings, newSumMapping(pkger.SafeID(endpoints[0].NotificationEndpoint.GetID()), endpoints[0].NotificationEndpoint.GetName(), influxdb.NotificationEndpointResourceType))
+		hasMapping(t, mappings, newSumMapping(rule.ID, rule.Name, influxdb.NotificationRuleResourceType))
+		hasMapping(t, mappings, newSumMapping(task.ID, task.Name, influxdb.TasksResourceType))
 		hasMapping(t, mappings, newSumMapping(pkger.SafeID(teles[0].TelegrafConfig.ID), teles[0].TelegrafConfig.Name, influxdb.TelegrafsResourceType))
+		hasMapping(t, mappings, newSumMapping(vars[0].ID, vars[0].Name, influxdb.VariablesResourceType))
 
 		t.Run("pkg with same bkt-var-label does nto create new resources for them", func(t *testing.T) {
 			// validate the new package doesn't create new resources for bkts/labels/vars
@@ -266,11 +329,80 @@ func TestLauncher_Pkger(t *testing.T) {
 			require.NotEqual(t, sum1.Dashboards, sum2.Dashboards)
 		})
 
+		t.Run("referenced secret values provided do not create new secrets", func(t *testing.T) {
+			applyPkgStr := func(t *testing.T, pkgStr string) pkger.Summary {
+				t.Helper()
+				pkg, err := pkger.Parse(pkger.EncodingYAML, pkger.FromString(pkgStr))
+				require.NoError(t, err)
+
+				sum, err := svc.Apply(ctx, l.Org.ID, l.User.ID, pkg)
+				require.NoError(t, err)
+				return sum
+			}
+
+			const pkgWithSecretRaw = `apiVersion: 0.1.0
+kind: Package
+meta:
+  pkgName:      pkg_name
+  pkgVersion:   1
+  description:  pack description
+spec:
+  resources:
+    - kind: Notification_Endpoint_Pager_Duty
+      name: pager_duty_notification_endpoint
+      url:  http://localhost:8080/orgs/7167eb6719fa34e5/alert-history
+      routingKey: secret-sauce
+`
+			secretSum := applyPkgStr(t, pkgWithSecretRaw)
+			require.Len(t, secretSum.NotificationEndpoints, 1)
+
+			id := secretSum.NotificationEndpoints[0].NotificationEndpoint.GetID()
+			expected := influxdb.SecretField{
+				Key: id.String() + "-routing-key",
+			}
+			secrets := secretSum.NotificationEndpoints[0].NotificationEndpoint.SecretFields()
+			require.Len(t, secrets, 1)
+			assert.Equal(t, expected, secrets[0])
+
+			const pkgWithSecretRef = `apiVersion: 0.1.0
+kind: Package
+meta:
+  pkgName:      pkg_name
+  pkgVersion:   1
+  description:  pack description
+spec:
+  resources:
+    - kind: Notification_Endpoint_Pager_Duty
+      name: pager_duty_notification_endpoint
+      url:  http://localhost:8080/orgs/7167eb6719fa34e5/alert-history
+      routingKey:
+        secretRef:
+          key: %s-routing-key
+`
+			secretSum = applyPkgStr(t, fmt.Sprintf(pkgWithSecretRef, id.String()))
+			require.Len(t, secretSum.NotificationEndpoints, 1)
+
+			expected = influxdb.SecretField{
+				Key: id.String() + "-routing-key",
+			}
+			secrets = secretSum.NotificationEndpoints[0].NotificationEndpoint.SecretFields()
+			require.Len(t, secrets, 1)
+			assert.Equal(t, expected, secrets[0])
+		})
+
 		t.Run("exporting resources with existing ids should return a valid pkg", func(t *testing.T) {
 			resToClone := []pkger.ResourceToClone{
 				{
 					Kind: pkger.KindBucket,
 					ID:   influxdb.ID(bkts[0].ID),
+				},
+				{
+					Kind: pkger.KindCheck,
+					ID:   checks[0].Check.GetID(),
+				},
+				{
+					Kind: pkger.KindCheck,
+					ID:   checks[1].Check.GetID(),
 				},
 				{
 					Kind: pkger.KindDashboard,
@@ -281,12 +413,25 @@ func TestLauncher_Pkger(t *testing.T) {
 					ID:   influxdb.ID(labels[0].ID),
 				},
 				{
+					Kind: pkger.KindNotificationEndpoint,
+					ID:   endpoints[0].NotificationEndpoint.GetID(),
+				},
+				{
+					Kind: pkger.KindTask,
+					ID:   influxdb.ID(task.ID),
+				},
+				{
 					Kind: pkger.KindTelegraf,
 					ID:   teles[0].TelegrafConfig.ID,
 				},
 			}
 
 			resWithNewName := []pkger.ResourceToClone{
+				{
+					Kind: pkger.KindNotificationRule,
+					Name: "new rule name",
+					ID:   influxdb.ID(rule.ID),
+				},
 				{
 					Kind: pkger.KindVariable,
 					Name: "new name",
@@ -321,6 +466,14 @@ func TestLauncher_Pkger(t *testing.T) {
 			assert.Equal(t, "rucket_1", bkts[0].Name)
 			hasLabelAssociations(t, bkts[0].LabelAssociations, 1, "label_1")
 
+			checks := newSum.Checks
+			require.Len(t, checks, 2)
+			for i := range make([]struct{}, 2) {
+				assert.Zero(t, checks[0].Check.GetID())
+				assert.Equal(t, fmt.Sprintf("check_%d", i), checks[i].Check.GetName())
+				hasLabelAssociations(t, checks[i].LabelAssociations, 1, "label_1")
+			}
+
 			dashs := newSum.Dashboards
 			require.Len(t, dashs, 1)
 			assert.Zero(t, dashs[0].ID)
@@ -330,9 +483,33 @@ func TestLauncher_Pkger(t *testing.T) {
 			require.Len(t, dashs[0].Charts, 1)
 			assert.Equal(t, influxdb.ViewPropertyTypeSingleStat, dashs[0].Charts[0].Properties.GetType())
 
+			newEndpoints := newSum.NotificationEndpoints
+			require.Len(t, newEndpoints, 1)
+			assert.Equal(t, endpoints[0].NotificationEndpoint.GetName(), newEndpoints[0].NotificationEndpoint.GetName())
+			assert.Equal(t, endpoints[0].NotificationEndpoint.GetDescription(), newEndpoints[0].NotificationEndpoint.GetDescription())
+			hasLabelAssociations(t, newEndpoints[0].LabelAssociations, 1, "label_1")
+
+			require.Len(t, newSum.NotificationRules, 1)
+			newRule := newSum.NotificationRules[0]
+			assert.Equal(t, "new rule name", newRule.Name)
+			assert.Zero(t, newRule.EndpointID)
+			assert.Equal(t, rule.EndpointName, newRule.EndpointName)
+			hasLabelAssociations(t, newRule.LabelAssociations, 1, "label_1")
+
+			require.Len(t, newSum.Tasks, 1)
+			newTask := newSum.Tasks[0]
+			assert.Equal(t, task.Name, newTask.Name)
+			assert.Equal(t, task.Description, newTask.Description)
+			assert.Equal(t, task.Cron, newTask.Cron)
+			assert.Equal(t, task.Every, newTask.Every)
+			assert.Equal(t, task.Offset, newTask.Offset)
+			assert.Equal(t, task.Query, newTask.Query)
+			assert.Equal(t, task.Status, newTask.Status)
+
 			require.Len(t, newSum.TelegrafConfigs, 1)
 			assert.Equal(t, teles[0].TelegrafConfig.Name, newSum.TelegrafConfigs[0].TelegrafConfig.Name)
 			assert.Equal(t, teles[0].TelegrafConfig.Description, newSum.TelegrafConfigs[0].TelegrafConfig.Description)
+			hasLabelAssociations(t, newSum.TelegrafConfigs[0].LabelAssociations, 1, "label_1")
 
 			vars := newSum.Variables
 			require.Len(t, vars, 1)
@@ -357,9 +534,11 @@ func TestLauncher_Pkger(t *testing.T) {
 					BucketService: l.BucketService(t),
 					killCount:     0, // kill on first update for bucket
 				}),
+				pkger.WithCheckSVC(l.CheckService()),
 				pkger.WithDashboardSVC(l.DashboardService(t)),
 				pkger.WithLabelSVC(l.LabelService(t)),
-				pkger.WithNoticationEndpointSVC(l.NotificationEndpointService(t)),
+				pkger.WithNotificationEndpointSVC(l.NotificationEndpointService(t)),
+				pkger.WithTaskSVC(l.TaskServiceKV()),
 				pkger.WithTelegrafSVC(l.TelegrafService(t)),
 				pkger.WithVariableSVC(l.VariableService(t)),
 			)
@@ -371,6 +550,16 @@ func TestLauncher_Pkger(t *testing.T) {
 			require.NoError(t, err)
 			// make sure the desc change is not applied and is rolled back to prev desc
 			assert.Equal(t, bkts[0].Description, bkt.Description)
+
+			ch, err := l.CheckService().FindCheckByID(ctx, checks[0].Check.GetID())
+			require.NoError(t, err)
+			ch.SetOwnerID(0)
+			deadman, ok := ch.(*check.Threshold)
+			require.True(t, ok)
+			// validate the change to query is not persisting returned to previous state.
+			// not checking entire bits, b/c we dont' save userID and so forth and makes a
+			// direct comparison very annoying...
+			assert.Equal(t, checks[0].Check.(*check.Threshold).Query.Text, deadman.Query.Text)
 
 			label, err := l.LabelService(t).FindLabelByID(ctx, influxdb.ID(labels[0].ID))
 			require.NoError(t, err)
@@ -401,7 +590,22 @@ func newPkg(t *testing.T) *pkger.Pkg {
 	return pkg
 }
 
-const pkgYMLStr = `apiVersion: 0.1.0
+const telConf = `[agent]
+  interval = "10s"
+  metric_batch_size = 1000
+  metric_buffer_limit = 10000
+  collection_jitter = "0s"
+  flush_interval = "10s"
+[[outputs.influxdb_v2]]
+  urls = ["http://localhost:9999"]
+  token = "$INFLUX_TOKEN"
+  organization = "rg"
+  bucket = "rucket_3"
+[[inputs.cpu]]
+  percpu = true
+`
+
+var pkgYMLStr = fmt.Sprintf(`apiVersion: 0.1.0
 kind: Package
 meta:
   pkgName:      pkg_name
@@ -452,21 +656,8 @@ spec:
       associations:
         - kind: Label
           name: label_1
-      config: |
-        [agent]
-          interval = "10s"
-          metric_batch_size = 1000
-          metric_buffer_limit = 10000
-          collection_jitter = "0s"
-          flush_interval = "10s"
-        [[outputs.influxdb_v2]]
-          urls = ["http://localhost:9999"]
-          token = "$INFLUX_TOKEN"
-          organization = "rg"
-          bucket = "rucket_3"
-        [[inputs.cpu]]
-          percpu = true
-    - kind: NotificationEndpointHTTP
+      config: %+q
+    - kind: Notification_Endpoint_HTTP
       name: http_none_auth_notification_endpoint
       type: none
       description: http none auth desc
@@ -474,9 +665,93 @@ spec:
       url:  https://www.example.com/endpoint/noneauth
       status: inactive
       associations:
+      - kind: Label
+        name: label_1
+    - kind: Check_Threshold
+      name: check_0
+      every: 1m
+      query:  >
+        from(bucket: "rucket_1")
+          |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+          |> filter(fn: (r) => r._measurement == "cpu")
+          |> filter(fn: (r) => r._field == "usage_idle")
+          |> aggregateWindow(every: 1m, fn: mean)
+          |> yield(name: "mean")
+      statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
+      tags:
+        - key: tag_1
+          value: val_1
+      thresholds:
+        - type: inside_range
+          level: INfO
+          min: 30.0
+          max: 45.0
+        - type: outside_range
+          level: WARN
+          min: 60.0
+          max: 70.0
+        - type: greater
+          level: CRIT
+          val: 80
+        - type: lesser
+          level: OK
+          val: 30
+      associations:
         - kind: Label
           name: label_1
-`
+    - kind: Check_Deadman
+      name: check_1
+      description: desc_1
+      every: 5m
+      level: cRiT
+      offset: 10s
+      query:  >
+        from(bucket: "rucket_1")
+          |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+          |> filter(fn: (r) => r._measurement == "cpu")
+          |> filter(fn: (r) => r._field == "usage_idle")
+          |> aggregateWindow(every: 1m, fn: mean)
+          |> yield(name: "mean")
+      reportZero: true
+      staleTime: 10m
+      statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
+      timeSince: 90s
+      associations:
+        - kind: Label
+          name: label_1
+    - kind: Notification_Rule
+      name: rule_0
+      description: desc_0
+      endpointName: http_none_auth_notification_endpoint
+      every: 10m
+      offset: 30s
+      messageTemplate: "Notification Rule: ${ r._notification_rule_name } triggered by check: ${ r._check_name }: ${ r._message }"
+      status: active
+      statusRules:
+        - currentLevel: WARN
+        - currentLevel: CRIT
+          previousLevel: OK
+      tagRules:
+        - key: k1
+          value: v2
+          operator: eQuAl
+        - key: k1
+          value: v1
+          operator: eQuAl
+      associations:
+        - kind: Label
+          name: label_1
+    - kind: Task
+      name: task_1
+      description: desc_1
+      cron: 15 * * * *
+      query:  >
+        from(bucket: "rucket_1")
+          |> yield()
+      associations:
+        - kind: Label
+          name: label_1
+`, telConf)
 
 const updatePkgYMLStr = `apiVersion: 0.1.0
 kind: Package
@@ -505,13 +780,23 @@ spec:
       associations:
         - kind: Label
           name: label_1
-    - kind: NotificationEndpointHTTP
+    - kind: Notification_Endpoint_HTTP
       name: http_none_auth_notification_endpoint
       type: none
       description: new desc
       method: GET
       url:  https://www.example.com/endpoint/noneauth
       status: active
+    - kind: Check_Threshold
+      name: check_0
+      every: 1m
+      query:  from("rucket1") |> yield()
+      statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
+      thresholds:
+        - type: inside_range
+          level: INfO
+          min: 30.0
+          max: 45.0
 `
 
 type fakeBucketSVC struct {

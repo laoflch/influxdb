@@ -26,6 +26,7 @@ describe('DataExplorer', () => {
     cy.signin().then(({body}) => {
       cy.wrap(body.org).as('org')
       cy.createMapVariable(body.org.id)
+      cy.wrap(body.bucket).as('bucket')
     })
 
     cy.fixture('routes').then(({orgs, explorer}) => {
@@ -348,7 +349,8 @@ describe('DataExplorer', () => {
     })
   })
 
-  describe('raw script editing', () => {
+  // todo: investigate flakiness of this test: https://github.com/influxdata/influxdb/issues/16330
+  describe.skip('raw script editing', () => {
     beforeEach(() => {
       cy.getByTestID('switch-to-script-editor').click()
     })
@@ -481,7 +483,7 @@ describe('DataExplorer', () => {
       })
 
       cy.getByTestID('save-query-as').click()
-      cy.get('label[for="save-as-task"]').click()
+      cy.getByTestID('task--radio-button').click()
       cy.getByTestID('task-form-name').type(taskName)
       cy.getByTestID('task-form-schedule-input').type('4h')
       cy.getByTestID('task-form-save').click()
@@ -517,7 +519,10 @@ describe('DataExplorer', () => {
 
     it('can remove a second query using tab context menu', () => {
       cy.get('.query-tab').trigger('contextmenu')
-      cy.getByTestID('right-click--remove-tab').should('have.class', 'disabled')
+      cy.getByTestID('right-click--remove-tab').should(
+        'have.class',
+        'cf-right-click--menu-item__disabled'
+      )
 
       cy.get('.time-machine-queries--new').click()
       cy.get('.query-tab').should('have.length', 2)
@@ -551,26 +556,9 @@ describe('DataExplorer', () => {
 
     describe('visualize with 360 lines', () => {
       const numLines = 360
-
       beforeEach(() => {
-        cy.flush()
-
-        cy.signin().then(({body}) => {
-          const {
-            org: {id},
-            bucket,
-          } = body
-          cy.wrap(body.org).as('org')
-          cy.wrap(bucket).as('bucket')
-
-          // POST 360 lines to the server
-          cy.writeData(lines(numLines))
-
-          // start at the data explorer
-          cy.fixture('routes').then(({orgs, explorer}) => {
-            cy.visit(`${orgs}/${id}${explorer}`)
-          })
-        })
+        // POST 360 lines to the server
+        cy.writeData(lines(numLines))
       })
 
       it('can view time-series data', () => {
@@ -596,6 +584,54 @@ describe('DataExplorer', () => {
         cy.getByTestID('raw-data--toggle').click()
         cy.getByTestID('raw-data-table').should('exist')
         cy.getByTestID('raw-data--toggle').click()
+      })
+
+      it('can view table data & sort values numerically', () => {
+        // build the query to return data from beforeEach
+        cy.getByTestID(`selector-list m`).click()
+        cy.getByTestID('selector-list v').click()
+        cy.getByTestID(`selector-list tv1`).click()
+        cy.getByTestID('selector-list sort').click()
+
+        cy.getByTestID('time-machine-submit-button').click()
+
+        cy.getByTestID('view-type--dropdown').click()
+        cy.getByTestID(`view-type--table`).click()
+        // check to see that the FE rows are NOT sorted with flux sort
+        cy.get('.table-graph-cell__sort-asc').should('not.exist')
+        cy.get('.table-graph-cell__sort-desc').should('not.exist')
+        cy.getByTestID('_value-table-header')
+          .should('exist')
+          .then(el => {
+            // get the column index
+            const columnIndex = el[0].getAttribute('data-column-index')
+            let prev = -Infinity
+            // get all the column values for that one and see if they are in order
+            cy.get(`[data-column-index="${columnIndex}"]`).each(val => {
+              const num = Number(val.text())
+              if (isNaN(num) === false) {
+                expect(num > prev).to.equal(true)
+                prev = num
+              }
+            })
+          })
+        cy.getByTestID('_value-table-header').click()
+        cy.get('.table-graph-cell__sort-asc').should('exist')
+        cy.getByTestID('_value-table-header').click()
+        cy.get('.table-graph-cell__sort-desc').should('exist')
+        cy.getByTestID('_value-table-header').then(el => {
+          // get the column index
+          const columnIndex = el[0].getAttribute('data-column-index')
+          let prev = Infinity
+          // get all the column values for that one and see if they are in order
+          cy.get(`[data-column-index="${columnIndex}"]`).each(val => {
+            const num = Number(val.text())
+            if (isNaN(num) === false) {
+              expect(num < prev).to.equal(true)
+              prev = num
+            }
+          })
+        })
       })
     })
   })

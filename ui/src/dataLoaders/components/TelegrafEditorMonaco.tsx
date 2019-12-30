@@ -32,11 +32,17 @@ class TelegrafEditorMonaco extends PureComponent<Props> {
     const {script} = this.props
 
     return (
-      <Editor
-        script={script}
-        onChangeScript={this.handleChange}
-        willMount={this.connect}
-      />
+      <div className="telegraf-editor--middle-column">
+        <div className="telegraf-editor--column-heading">
+          <span className="telegraf-editor--title">Configuration File</span>
+        </div>
+        <Editor
+          className="telegraf-editor--monaco"
+          script={script}
+          onChangeScript={this.handleChange}
+          willMount={this.connect}
+        />
+      </div>
     )
   }
 
@@ -128,7 +134,10 @@ const mstp = (state: AppState): StateProps => {
     state.telegrafEditor.text ||
     map['__default__'].include
       .map((i: string) => {
-        return map[i].code
+        if (!map.hasOwnProperty(i)) {
+          return ''
+        }
+        return map[i].config
       })
       .join('\n')
 
