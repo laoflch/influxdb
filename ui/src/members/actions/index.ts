@@ -1,8 +1,10 @@
 // Libraries
-import _ from 'lodash'
+import {get} from 'lodash'
+import {normalize, NormalizedSchema} from 'normalizr'
 
 // API
 import * as api from 'src/client'
+import * as schemas from 'src/schemas'
 
 // Types
 import {RemoteDataState, GetState} from 'src/types'
@@ -19,56 +21,49 @@ import {
   memberRemoveFailed,
 } from 'src/shared/copy/notifications'
 
-export type Action = SetMembers | AddMember | RemoveMember | NotifyAction
+// Selectors
+import {getOrg} from 'src/organizations/selectors'
 
-interface SetMembers {
-  type: 'SET_MEMBERS'
-  payload: {
-    status: RemoteDataState
-    list: Member[]
-  }
-}
+export type Action =
+  | ReturnType<typeof setMembers>
+  | ReturnType<typeof addMember>
+  | ReturnType<typeof removeMember>
+  | NotifyAction
+
+export const SET_MEMBERS = 'SET_MEMBERS'
+export const ADD_MEMBER = 'ADD_MEMBER'
+export const REMOVE_MEMBER = 'REMOVE_MEMBER'
 
 export const setMembers = (
   status: RemoteDataState,
-  list?: Member[]
-): SetMembers => ({
-  type: 'SET_MEMBERS',
-  payload: {status, list},
-})
+  schema?: NormalizedSchema<schemas.MemberEntities, string[]>
+) =>
+  ({
+    type: SET_MEMBERS,
+    status,
+    schema,
+  } as const)
 
-interface AddMember {
-  type: 'ADD_MEMBER'
-  payload: {
-    member: Member
-  }
-}
+export const addMember = (
+  schema: NormalizedSchema<schemas.MemberEntities, string>
+) =>
+  ({
+    type: ADD_MEMBER,
+    schema,
+  } as const)
 
-export const addMember = (member: Member): AddMember => ({
-  type: 'ADD_MEMBER',
-  payload: {member},
-})
-
-interface RemoveMember {
-  type: 'REMOVE_MEMBER'
-  payload: {id: string}
-}
-
-export const removeMember = (id: string): RemoveMember => ({
-  type: 'REMOVE_MEMBER',
-  payload: {id},
-})
+export const removeMember = (id: string) =>
+  ({
+    type: REMOVE_MEMBER,
+    id,
+  } as const)
 
 export const getMembers = () => async (
   dispatch: Dispatch<Action>,
   getState: GetState
 ) => {
   try {
-    const {
-      orgs: {
-        org: {id},
-      },
-    } = getState()
+    const {id} = getOrg(getState())
     dispatch(setMembers(RemoteDataState.Loading))
 
     const [ownersResp, membersResp] = await Promise.all([
@@ -90,37 +85,41 @@ export const getMembers = () => async (
 
     const allMembers = [...owners, ...members]
 
-    dispatch(setMembers(RemoteDataState.Done, allMembers))
+    const normalized = normalize<Member, schemas.MemberEntities, string[]>(
+      allMembers,
+      [schemas.members]
+    )
+
+    dispatch(setMembers(RemoteDataState.Done, normalized))
   } catch (e) {
     console.error(e)
     dispatch(setMembers(RemoteDataState.Error))
   }
 }
 
-export const addNewMember = (member: AddResourceMemberRequestBody) => async (
+export const addNewMember = (data: AddResourceMemberRequestBody) => async (
   dispatch: Dispatch<Action>,
   getState: GetState
 ) => {
   try {
-    const {
-      orgs: {
-        org: {id},
-      },
-    } = getState()
-
-    const resp = await api.postOrgsMember({orgID: id, data: member})
+    const {id} = getOrg(getState())
+    const resp = await api.postOrgsMember({orgID: id, data})
 
     if (resp.status !== 201) {
       throw new Error(resp.data.message)
     }
 
     const newMember = resp.data
+    const member = normalize<Member, schemas.MemberEntities, string>(
+      newMember,
+      schemas.members
+    )
 
-    dispatch(addMember(newMember))
-    dispatch(notify(memberAddSuccess(member.name)))
+    dispatch(addMember(member))
+    dispatch(notify(memberAddSuccess(newMember.name)))
   } catch (e) {
     console.error(e)
-    const message = _.get(e, 'response.data.message', 'Unknown error')
+    const message = get(e, 'response.data.message', 'Unknown error')
     dispatch(notify(memberAddFailed(message)))
     throw e
   }
@@ -131,12 +130,7 @@ export const deleteMember = (member: Member) => async (
   getState: GetState
 ) => {
   try {
-    const {
-      orgs: {
-        org: {id},
-      },
-    } = getState()
-
+    const {id} = getOrg(getState())
     const resp = await api.deleteOrgsMember({orgID: id, userID: member.id})
 
     if (resp.status !== 204) {

@@ -9,10 +9,13 @@ import {
   ILabelProperties,
 } from '@influxdata/influx'
 import {createAuthorization} from 'src/authorizations/apis'
-import {postWrite} from 'src/client'
+import {postWrite as apiPostWrite, postLabel as apiPostLabel} from 'src/client'
 
 // Utils
 import {createNewPlugin} from 'src/dataLoaders/utils/pluginConfigs'
+import {addLabelDefaults} from 'src/labels/utils'
+import {getDataLoaders, getSteps} from 'src/dataLoaders/selectors'
+import {getOrg} from 'src/organizations/selectors'
 
 // Constants
 import {
@@ -30,8 +33,7 @@ import {
   BundleName,
   ConfigurationState,
 } from 'src/types/dataLoaders'
-import {AppState} from 'src/types'
-import {RemoteDataState} from 'src/types'
+import {AppState, RemoteDataState} from 'src/types'
 import {
   WritePrecision,
   TelegrafRequest,
@@ -339,19 +341,13 @@ export const createOrUpdateTelegrafConfigAsync = () => async (
   getState: GetState
 ) => {
   const {
-    dataLoading: {
-      dataLoaders: {
-        telegrafPlugins,
-        telegrafConfigID,
-        telegrafConfigName,
-        telegrafConfigDescription,
-      },
-      steps: {bucket},
-    },
-    orgs: {
-      org: {name},
-    },
-  } = getState()
+    telegrafPlugins,
+    telegrafConfigID,
+    telegrafConfigName,
+    telegrafConfigDescription,
+  } = getDataLoaders(getState())
+  const {name} = getOrg(getState())
+  const {bucket} = getSteps(getState())
 
   const influxDB2Out = {
     name: TelegrafPluginOutputInfluxDBV2.NameEnum.InfluxdbV2,
@@ -389,15 +385,14 @@ export const createOrUpdateTelegrafConfigAsync = () => async (
   createTelegraf(dispatch, getState, plugins)
 }
 
-const createTelegraf = async (dispatch, getState, plugins) => {
+const createTelegraf = async (dispatch, getState: GetState, plugins) => {
   try {
-    const {
-      dataLoading: {
-        dataLoaders: {telegrafConfigName, telegrafConfigDescription},
-        steps: {bucket, bucketID},
-      },
-      orgs: {org},
-    } = getState()
+    const state = getState()
+    const {telegrafConfigName, telegrafConfigDescription} = getDataLoaders(
+      state
+    )
+    const {bucket, bucketID} = getSteps(state)
+    const org = getOrg(getState())
 
     const telegrafRequest: TelegrafRequest = {
       name: telegrafConfigName,
@@ -452,11 +447,19 @@ const createTelegraf = async (dispatch, getState, plugins) => {
       tokenID: createdToken.id,
     } as ILabelProperties // hack to make compiler work
 
-    const createdLabel = await client.labels.create({
-      orgID: org.id,
-      name: `@influxdata.token-${new Date().getTime()}`, // fix for https://github.com/influxdata/influxdb/issues/15730
-      properties,
+    const resp = await apiPostLabel({
+      data: {
+        orgID: org.id,
+        name: `@influxdata.token-${new Date().getTime()}`, // fix for https://github.com/influxdata/influxdb/issues/15730
+        properties,
+      },
     })
+
+    if (resp.status !== 201) {
+      throw new Error(resp.data.message)
+    }
+
+    const createdLabel = addLabelDefaults(resp.data.label)
 
     // add label to telegraf config
     const label = await client.telegrafConfigs.addLabel(tc.id, createdLabel)
@@ -470,6 +473,7 @@ const createTelegraf = async (dispatch, getState, plugins) => {
     dispatch(addTelegraf(config))
     dispatch(notify(TelegrafConfigCreationSuccess))
   } catch (error) {
+    console.error(error.message)
     dispatch(notify(TelegrafConfigCreationError))
   }
 }
@@ -554,7 +558,10 @@ export const writeLineProtocolAction = (
   try {
     dispatch(setLPStatus(RemoteDataState.Loading))
 
-    const resp = await postWrite({data: body, query: {org, bucket, precision}})
+    const resp = await apiPostWrite({
+      data: body,
+      query: {org, bucket, precision},
+    })
 
     if (resp.status === 204) {
       dispatch(setLPStatus(RemoteDataState.Done))

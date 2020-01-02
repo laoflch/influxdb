@@ -53,6 +53,7 @@ import {exportVariables} from 'src/variables/utils/exportVariables'
 import {getSaveableView} from 'src/timeMachine/selectors'
 import {incrementCloneName} from 'src/utils/naming'
 import {isLimitError} from 'src/cloud/utils/limits'
+import {getOrg} from 'src/organizations/selectors'
 
 // Constants
 import * as copy from 'src/shared/copy/notifications'
@@ -60,7 +61,7 @@ import {DEFAULT_DASHBOARD_NAME} from 'src/dashboards/constants/index'
 
 // Types
 import {RemoteDataState} from 'src/types'
-import {CreateCell, ILabel} from '@influxdata/influx'
+import {CreateCell} from '@influxdata/influx'
 import {
   Dashboard,
   NewView,
@@ -68,6 +69,7 @@ import {
   GetState,
   View,
   DashboardTemplate,
+  Label,
 } from 'src/types'
 
 export enum ActionTypes {
@@ -141,7 +143,7 @@ interface AddDashboardLabelsAction {
   type: ActionTypes.AddDashboardLabels
   payload: {
     dashboardID: string
-    labels: ILabel[]
+    labels: Label[]
   }
 }
 
@@ -149,7 +151,7 @@ interface RemoveDashboardLabelsAction {
   type: ActionTypes.RemoveDashboardLabels
   payload: {
     dashboardID: string
-    labels: ILabel[]
+    labels: Label[]
   }
 }
 
@@ -215,7 +217,7 @@ export const removeCell = (
 
 export const addDashboardLabels = (
   dashboardID: string,
-  labels: ILabel[]
+  labels: Label[]
 ): AddDashboardLabelsAction => ({
   type: ActionTypes.AddDashboardLabels,
   payload: {dashboardID, labels},
@@ -223,7 +225,7 @@ export const addDashboardLabels = (
 
 export const removeDashboardLabels = (
   dashboardID: string,
-  labels: ILabel[]
+  labels: Label[]
 ): RemoveDashboardLabelsAction => ({
   type: ActionTypes.RemoveDashboardLabels,
   payload: {dashboardID, labels},
@@ -236,9 +238,7 @@ export const createDashboard = () => async (
   getState: GetState
 ): Promise<void> => {
   try {
-    const {
-      orgs: {org},
-    } = getState()
+    const org = getOrg(getState())
 
     const newDashboard = {
       name: DEFAULT_DASHBOARD_NAME,
@@ -265,11 +265,9 @@ export const cloneDashboard = (dashboard: Dashboard) => async (
   getState: GetState
 ): Promise<void> => {
   try {
-    const {
-      orgs: {org},
-      dashboards,
-    } = getState()
+    const {dashboards} = getState()
 
+    const org = getOrg(getState())
     const allDashboardNames = dashboards.list.map(d => d.name)
 
     const clonedName = incrementCloneName(allDashboardNames, dashboard.name)
@@ -293,9 +291,7 @@ export const getDashboardsAsync = () => async (
   getState: GetState
 ): Promise<Dashboard[]> => {
   try {
-    const {
-      orgs: {org},
-    } = getState()
+    const org = getOrg(getState())
 
     dispatch(setDashboards(RemoteDataState.Loading))
     const dashboards = await getDashboardsAJAX(org.id)
@@ -313,9 +309,7 @@ export const createDashboardFromTemplate = (
   template: DashboardTemplate
 ) => async (dispatch, getState: GetState) => {
   try {
-    const {
-      orgs: {org},
-    } = getState()
+    const org = getOrg(getState())
 
     await createDashboardFromTemplateAJAX(template, org.id)
 
@@ -364,7 +358,7 @@ export const refreshDashboardVariableValues = (
 
 export const getDashboardAsync = (dashboardID: string) => async (
   dispatch,
-  getState
+  getState: GetState
 ): Promise<void> => {
   try {
     // Fetch the dashboard and all variables a user has access to
@@ -387,9 +381,7 @@ export const getDashboardAsync = (dashboardID: string) => async (
     dispatch(setDashboard(dashboard))
     dispatch(updateTimeRangeFromQueryParams(dashboardID))
   } catch (error) {
-    const {
-      orgs: {org},
-    } = getState()
+    const org = getOrg(getState())
     dispatch(push(`/orgs/${org.id}/dashboards`))
     dispatch(notify(copy.dashboardGetFailed(dashboardID, error.message)))
     return
@@ -527,7 +519,7 @@ export const copyDashboardCellAsync = (dashboard: Dashboard, cell: Cell) => (
 
 export const addDashboardLabelsAsync = (
   dashboardID: string,
-  labels: ILabel[]
+  labels: Label[]
 ) => async (dispatch: Dispatch<Action | PublishNotificationAction>) => {
   try {
     const newLabels = await client.dashboards.addLabels(
@@ -544,7 +536,7 @@ export const addDashboardLabelsAsync = (
 
 export const removeDashboardLabelsAsync = (
   dashboardID: string,
-  labels: ILabel[]
+  labels: Label[]
 ) => async (dispatch: Dispatch<Action | PublishNotificationAction>) => {
   try {
     await client.dashboards.removeLabels(dashboardID, labels.map(l => l.id))
@@ -575,9 +567,7 @@ export const convertToTemplate = (dashboardID: string) => async (
 ): Promise<void> => {
   try {
     dispatch(setExportTemplate(RemoteDataState.Loading))
-    const {
-      orgs: {org},
-    } = getState()
+    const org = getOrg(getState())
     const dashboard = await getDashboardAJAX(dashboardID)
     const pendingViews = dashboard.cells.map(c =>
       getViewAJAX(dashboardID, c.id)
