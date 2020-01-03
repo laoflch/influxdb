@@ -450,8 +450,8 @@ describe('DataExplorer', () => {
 
     it('shows the empty state when the query returns no results', () => {
       cy.getByTestID('time-machine--bottom').within(() => {
-        cy.get('textarea').type(
-          `from(bucket: "defbuck")
+        // prettier-ignore
+        cy.get('textarea').type(`from(bucket: "defbuck")
   |> range(start: -10s)
   |> filter(fn: (r) => r._measurement == "no exist")`,
           {force: true}
